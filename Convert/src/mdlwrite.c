@@ -1,622 +1,490 @@
-/* mdlwrite.c - writes studiohdr v48 MDL + VVD v4, byte-compatible with the
- * Source 2007 (Ep2/Orange Box) engine. Layout follows studiomdl's
- * WriteMDLHeader() / WriteModel() / WritePhysics() from write.cpp:
- *
- *   [studiohdr_t][bones][controllers][textures][texturedata]
- *   [bodyparts->models->meshes][vertdata(float4 w+char4 b)][triangles]
- *   [normals][tangents][keydata][stringtab]
- *   [collisionmodelinfo][convex pieces: verts/tris][bone for parent=-1]
- *   [localname][packfile?] ... then .VVD file separately.
- */
+/* mdlwrite.c - MDL (studiohdr v48) + VVD (v4) writer laid out like Valve's
+ * studiomdl write.cpp for static props. Engine locates lumps via header
+ * offsets; the string table lives at EOF. */
 #include "mdlc.h"
 
-long str_table_size(void);
-void *str_table_data(long *len);
+typedef struct { buf_t b; strtab_t st; } mdlio_t;
 
-#define ALIGN4(x) (((x)+3)&~3)
-
-/* CRC32 for header checksum (engine verifies only loosely; match zlib poly) */
 static unsigned int crc32_buf(const unsigned char *data, long len) {
     static unsigned int tab[256];
-    static int init = 0;
-    unsigned int c = 0xffffffffu;
-    long i;
-    if (!init) {
-        unsigned int n;
-        for (n = 0; n < 256; n++) {
-            unsigned int k = n;
-            int b;
-            for (b = 0; b < 8; b++) k = (k & 1) ? (0xEDB88320u ^ (k >> 1)) : (k >> 1);
-            tab[n] = k;
-        }
-        init = 1;
-    }
-    for (i = 0; i < len; i++) c = tab[(c ^ data[i]) & 0xff] ^ (c >> 8);
-    return c ^ 0xffffffffu;
+    static int ready = 0;
+    unsigned int c; long i;
+    if (!ready) { unsigned int n; int k;
+        for (n=0;n<256;n++){ c=n; for(k=0;k<8;k++) c=(c&1)?(0xEDB88320u^(c>>1)):(c>>1); tab[n]=c; }
+        ready=1; }
+    c = 0xFFFFFFFFu;
+    for (i=0;i<len;i++) c = tab[(c^data[i])&0xFF] ^ (c>>8);
+    return c ^ 0xFFFFFFFFu;
 }
-
-/* ---------------------------------------------------------- helpers */
-typedef struct {
-    buf_t b;             /* whole MDL image                                  */
-    strtab_t st;
-    long hdr_end;        /* sizeof(studiohdr_c_t) after patching offsets     */
-} mdlio_t;
-
 static int put_str(mdlio_t *w, const char *s) { return str_add(&w->st, s); }
+static void patch32(buf_t *b, long off, int val) { memcpy(b->data+off,&val,4); }
+static void patchf(buf_t *b, long off, float val) { memcpy(b->data+off,&val,4); }
 
-static void patch32(buf_t *b, long off, int val) {
-    memcpy(b->data + off, &val, 4);
+static float lod_error(const mesh_t *m0, const mesh_t *ml) {
+    float a0 = mesh_area(m0), al = mesh_area(ml);
+    if (a0 <= 0.0f) return 0.0f;
+    return fabsf(a0 - al) / a0;
 }
 
-/* ------------------------------------------------------------ main */
 int write_mdl_vvd(const char *basepath, const mesh_t *vis, mesh_t *lods[],
                   int nlods, const phys_t *phys, const opts_t *o) {
     mdlio_t W;
-    studiohdr_c_t hdr;
-    vec3d_t mn, mx;
-    long i, j;
-    int total_lods = nlods + 1;      /* LOD0 = full visual mesh              */
+    vec3d_t mn, mx, mid;
+    long i;
+    int total_lods = nlods + 1;
     unsigned int total_verts = 0, total_tris = 0;
-    long model_offset, mesh_base_off, lod_offsets[8], lod_tri_offs[8];
-    unsigned int lod_voff[8], lod_ntri[8], lod_nvert[8];
-    long collision_info_off, name_off;
     char mdlpath[600], vvdpath[600];
     FILE *f;
-    long strings_file_start;
-    long vertdata_off, norm_off, tan_off, tri_off;
+    unsigned int lod_nvert[8], lod_ntri[8];
+    long lod_mesh_at[8];
+    float lod_err[8];
+    long kv_off, bones_off, bc_off, hb_off, bp_off, model_off, mesh_off;
+    long mlod_off, smi_off, cmi_off, tex_off, tdat_off, skin_off, loff_off;
+    long coll_off, tri_off, vert_off, norm_off, tan_off, uv_off, fix_off;
 
-    memset(&W, 0, sizeof(W));
-    buf_init(&W.b);
-    str_init(&W.st, 4096);
+    memset(lod_nvert,0,sizeof lod_nvert); memset(lod_ntri,0,sizeof lod_ntri);
+    memset(lod_mesh_at,0,sizeof lod_mesh_at); memset(lod_err,0,sizeof lod_err);
+    memset(&W,0,sizeof W);
+    buf_init(&W.b); str_init(&W.st, 4096);
+    snprintf(mdlpath,sizeof mdlpath,"%s.mdl",basepath);
+    snprintf(vvdpath,sizeof vvdpath,"%s.vvd",basepath);
 
-    snprintf(mdlpath, sizeof(mdlpath), "%s.mdl", basepath);
-    snprintf(vvdpath, sizeof(vvdpath), "%s.vvd", basepath);
-
-    mesh_bounds(vis, &mn, &mx);
-
-    /* ---------------- reserve header ---------------- */
-    buf_put(&W.b, &hdr /*zero*/, 0); /* no-op keeps API warm */
-    {
-        studiohdr_c_t z; memset(&z, 0, sizeof(z));
-        buf_put(&W.b, &z, sizeof(z));
+    mesh_bounds(vis,&mn,&mx);
+    mid.x=(mn.x+mx.x)*0.5f; mid.y=(mn.y+mx.y)*0.5f; mid.z=(mn.z+mx.z)*0.5f;
+    for (i=0;i<total_lods;i++) {
+        const mesh_t *m=(i==0)?vis:lods[i-1];
+        lod_nvert[i]=m->nv; lod_ntri[i]=m->nt;
+        if (i>0) lod_err[i]=lod_error(vis,m);
     }
 
-    /* ---------------- keyvalue data (empty but valid) --------------- */
-    /* textureline: minimal QC-equivalent so HLMV/material system is happy */
-    {
-        char line[256];
-        long tl_off;
-        snprintf(line, sizeof(line),
-                 "/* StudioMDL (stl2mdl) auto-generated\n"
-                 "$modelname \"%s\"\n"
-                 "$cd \"%s\"\n"
-                 "$texturegroup \"skin1\" { { \"%s\" } }\n"
-                 "$hierarchy \"None\"\n"
-                 "$staticprop\n"
-                 "$schema \"%s.dmxschema\"\n"
-                 "$collisionmodel \"STL-DECIMATED\" { $mass %.3f }\n*/\n",
-                 basepath, ".", o->material, basepath, (double)(phys->mass));
-        tl_off = W.b.size;
-        buf_put(&W.b, line, strlen(line) + 1);
-        patch32(&W.b, offsetof(studiohdr_c_t, keydataoffset), (int)tl_off);
-        patch32(&W.b, offsetof(studiohdr_c_t, keydatacount), (int)strlen(line) + 1);
+    /* 1. header placeholder */
+    { studiohdr_c_t z; memset(&z,0,sizeof z); buf_put(&W.b,&z,sizeof z); }
+
+    /* 2. textureline (QC echo) */
+    { char line[1024]; int ln;
+      snprintf(line,sizeof line,
+        "// generated by stl2mdl (studiohdr v48 compiler)\r\n"
+        "$modelname \"%s\"\r\n$cd \".\"\r\n$path \".\"\r\n$staticprop\r\n"
+        "$surfaceprop \"default\"\r\n$texturegroup \"skin1\" { { \"%s\" } }\r\n"
+        "$hierarchy \"None\"\r\n$model \"_default\" \"%s\" {\r\n  $static\r\n}\r\n"
+        "$collisionmodel \"stl-decimated\" { $mass %.3f $maxconvexpieces %d }\r\n",
+        o->out, o->material[0]?o->material:"models/props/stl_default",
+        o->out, (double)phys->mass, phys->npieces);
+      ln=(int)strlen(line)+1;
+      patch32(&W.b,offsetof(studiohdr_c_t,keydataoffset),(int)W.b.size);
+      patch32(&W.b,offsetof(studiohdr_c_t,keydatacount),ln);
+      buf_put(&W.b,line,ln); }
+
+    /* 3. model keyvalue data */
+    { char kv[256]; int ln;
+      snprintf(kv,sizeof kv,"$basetexture \"%s\"\r\n$surfaceprop \"default\"\r\n",
+               o->material[0]?o->material:"models/props/stl_default");
+      ln=(int)strlen(kv)+1; kv_off=W.b.size; buf_put(&W.b,kv,ln); }
+
+    /* 4. bones */
+    { mstudiobone_c_t bone; int nbones=1+phys->npieces;
+      bones_off=buf_pad(&W.b,4);
+      patch32(&W.b,offsetof(studiohdr_c_t,bbonecount),nbones);
+      patch32(&W.b,offsetof(studiohdr_c_t,bboneoffset),(int)bones_off);
+      patch32(&W.b,offsetof(studiohdr_c_t,cbonecount),nbones);
+      patch32(&W.b,offsetof(studiohdr_c_t,cboneoffset),(int)bones_off);
+      memset(&bone,0,sizeof bone);
+      bone.sznameindex=put_str(&W,"ValveBiped.Bip01");
+      bone.parent=-1; bone.boneflags=BONE_ALWAYSLAST|BONE_USED_BY_BC;
+      bone.poseToBone[0][0]=1; bone.poseToBone[0][3]=-mid.x;
+      bone.poseToBone[1][1]=1; bone.poseToBone[1][3]=-mid.y;
+      bone.poseToBone[2][2]=1; bone.poseToBone[2][3]=-mid.z;
+      buf_put(&W.b,&bone,sizeof bone);
+      for (i=0;i<phys->npieces;i++) {
+        char nm[64]; vec3d_t pmn,pmx,pmid;
+        snprintf(nm,sizeof nm,"physpiece%ld",i);
+        mesh_bounds(phys->pieces[i],&pmn,&pmx);
+        pmid.x=(pmn.x+pmx.x)*0.5f; pmid.y=(pmn.y+pmx.y)*0.5f; pmid.z=(pmn.z+pmx.z)*0.5f;
+        memset(&bone,0,sizeof bone);
+        bone.sznameindex=put_str(&W,nm);
+        bone.parent=0; bone.boneflags=BONE_USED_BY_PHYSICS|BONE_CONFIG;
+        bone.poseToBone[0][0]=1; bone.poseToBone[0][3]=-pmid.x;
+        bone.poseToBone[1][1]=1; bone.poseToBone[1][3]=-pmid.y;
+        bone.poseToBone[2][2]=1; bone.poseToBone[2][3]=-pmid.z;
+        buf_put(&W.b,&bone,sizeof bone);
+      } }
+
+    /* 5. bone controllers (empty) */
+    bc_off=buf_pad(&W.b,4);
+    patch32(&W.b,offsetof(studiohdr_c_t,bcontrollercount),0);
+    patch32(&W.b,offsetof(studiohdr_c_t,bcontrolleroffset),(int)bc_off);
+    patch32(&W.b,offsetof(studiohdr_c_t,ccontrollercount),0);
+    patch32(&W.b,offsetof(studiohdr_c_t,ccontrolleroffset),(int)bc_off);
+
+    /* 6. hitbox set */
+    hb_off=buf_pad(&W.b,4);
+    { mstudiohitboxset_c_t set; mstudiobonebox_c_t bb;
+      memset(&set,0,sizeof set);
+      set.hitboxcount=1; strcpy(set.name,"all");
+      buf_put(&W.b,&set,sizeof set);
+      memset(&bb,0,sizeof bb);
+      bb.bone=0; bb.group=0; bb.bbmin=mn; bb.bbmax=mx;
+      bb.sznameindex=put_str(&W,"bbox"); bb.solid=0;
+      patch32(&W.b,hb_off+offsetof(mstudiohitboxset_c_t,hitboxoffset),(int)W.b.size);
+      buf_put(&W.b,&bb,sizeof bb);
+      patch32(&W.b,offsetof(studiohdr_c_t,hitboxsetoffset),(int)hb_off);
+      { int fl=STUDIOHDR_FLAGS_HITBOX_SET|STUDIOHDR_FLAGS_HITBOX_COLLIDE;
+        patch32(&W.b,offsetof(studiohdr_c_t,flags),fl); } }
+
+    /* 7. bodyparts */
+    bp_off=buf_pad(&W.b,4);
+    { mstudiobodyparts_c_t bp;
+      memset(&bp,0,sizeof bp);
+      bp.nummodels=1; strcpy(bp.name,"render");
+      buf_put(&W.b,&bp,sizeof bp);
+      patch32(&W.b,offsetof(studiohdr_c_t,tskinrefcount),1);
+      patch32(&W.b,offsetof(studiohdr_c_t,tskinoffset),(int)bp_off); }
+
+    /* 8. model */
+    model_off=buf_pad(&W.b,4);
+    { mstudiomodel_c_t m;
+      memset(&m,0,sizeof m);
+      strcpy(m.name,"_default");
+      m.meshcount=total_lods; m.lodcount=total_lods;
+      buf_put(&W.b,&m,sizeof m); }
+
+    /* 9. meshes */
+    mesh_off=buf_pad(&W.b,4);
+    { mstudiomesh_c_t ms;
+      for (i=0;i<total_lods;i++) {
+        memset(&ms,0,sizeof ms);
+        strcpy(ms.name,"world");
+        ms.vertexcount=(int)lod_nvert[i];
+        ms.trianglecount=(int)lod_ntri[i];
+        ms.normcount=(int)lod_nvert[i];
+        ms.tangentcount=(int)lod_nvert[i];
+        ms.uvcount=(int)lod_nvert[i];
+        lod_mesh_at[i]=W.b.size;
+        buf_put(&W.b,&ms,sizeof ms);
+      }
+      patch32(&W.b,model_off+offsetof(mstudiomodel_c_t,meshoffset),(int)mesh_off); }
+
+    /* 10. model LOD table */
+    mlod_off=buf_pad(&W.b,4);
+    { mstudiomodel_lod_t ml;
+      memset(&ml,0,sizeof ml);
+      for (i=0;i<8;i++) ml.remaplevel[i]=(int)((i<total_lods)?i:total_lods-1);
+      ml.force_material=-1;
+      buf_put(&W.b,&ml,sizeof ml);
+      patch32(&W.b,model_off+offsetof(mstudiomodel_c_t,lodoffset),(int)mlod_off); }
+
+    /* 11. simple model info */
+    smi_off=buf_pad(&W.b,4);
+    { mstudiesimplemodelinfo_t si;
+      for (i=0;i<total_lods;i++) {
+        memset(&si,0,sizeof si); si.lod=(int)i; si.city=0;
+        buf_put(&W.b,&si,sizeof si);
+      }
+      patch32(&W.b,offsetof(studiohdr_c_t,simplemodelinfo),(int)smi_off); }
+
+    /* 12. collisionmodelinfo */
+    cmi_off=buf_pad(&W.b,4);
+    { intu cmi[2];
+      cmi[0]=0; cmi[1]=put_str(&W,"generic");
+      buf_put(&W.b,cmi,sizeof cmi);
+      patch32(&W.b,offsetof(studiohdr_c_t,collisionmodelinfo_count),1);
+      patch32(&W.b,offsetof(studiohdr_c_t,collisionmodelinfo_offset),(int)cmi_off); }
+
+    /* 13. textures */
+    tex_off=buf_pad(&W.b,4);
+    { mstudiotexture_c_t tx;
+      int nameidx=put_str(&W,o->material[0]?o->material:"models/props/stl_default");
+      memset(&tx,0,sizeof tx);
+      strcpy(tx.name,"skin0001");
+      tx.flags=EX_PERSISTENT_HIGHRES;
+      tx.texdatacount=1;
+      tx.material=nameidx;
+      buf_put(&W.b,&tx,sizeof tx);
+      patchf(&W.b,tex_off+offsetof(mstudiotexture_c_t,bbox[1]),1.0f);
+      patch32(&W.b,offsetof(studiohdr_c_t,btexturecount),1);
+      patch32(&W.b,offsetof(studiohdr_c_t,btextureoffset),(int)tex_off);
+      patch32(&W.b,offsetof(studiohdr_c_t,ctexturecount),1);
+      patch32(&W.b,offsetof(studiohdr_c_t,ctextureoffset),(int)tex_off); }
+
+    /* 14. texture data (1x1 grey RGBA8) */
+    tdat_off=buf_pad(&W.b,16);
+    { mstudiotexturedata_c_t td;
+      memset(&td,0,sizeof td);
+      td.imageoffset=(int)(tdat_off+sizeof td);
+      td.imagesize=4; td.uncompressedsize=4;
+      buf_put(&W.b,&td,sizeof td);
+      { unsigned int px=0xFFA0A0A0u; buf_put(&W.b,&px,4); }
+      patch32(&W.b,tex_off+offsetof(mstudiotexture_c_t,texdataoffset),(int)tdat_off);
+      patch32(&W.b,offsetof(studiohdr_c_t,ctexturedatacount),1);
+      patch32(&W.b,offsetof(studiohdr_c_t,ctexturedataoffset),(int)tdat_off); }
+
+    /* 15. skin refs & local ordering */
+    skin_off=buf_pad(&W.b,4);
+    { intu mat0=0; buf_put(&W.b,&mat0,sizeof mat0);
+      patch32(&W.b,offsetof(studiohdr_c_t,skinrefcount_unused),1);
+      patch32(&W.b,offsetof(studiohdr_c_t,skinrefoffset_unused),(int)skin_off); }
+    loff_off=buf_pad(&W.b,4);
+    { intu z=0; buf_put(&W.b,&z,sizeof z);
+      patch32(&W.b,offsetof(studiohdr_c_t,tlocalordercount),1);
+      patch32(&W.b,offsetof(studiohdr_c_t,tlocalorderoffset),(int)loff_off); }
+
+    /* 16. collision models (VPhysics convex pieces) */
+    coll_off=buf_pad(&W.b,4);
+    { unsigned int cv_run=0;
+      for (i=0;i<phys->npieces;i++) {
+        const mesh_t *pc=phys->pieces[i];
+        mstudiocollisionmodel_c_t cm;
+        vec3d_t pmn,pmx,pc_com; float pi[6],pv[1]; float fm,dens;
+        long cm_at,v_at,t_at; int k;
+        dens=(phys->vol>0)?(phys->mass/phys->vol):1.0f;
+        mesh_massprops(pc,dens,pv,&pc_com,pi);
+        if (pv[0]<=0) pv[0]=1.0f;
+        fm=pv[0]*dens;
+        memset(&cm,0,sizeof cm);
+        cm.type=CONCAVE_TYPESPIECEMODE;
+        cm.count=(int)pc->nt;
+        cm.vertcount=(int)pc->nv;
+        cm.facecount=(int)pc->nt;
+        cm.surfacenameIndex=put_str(&W,"default");
+        cm.surfaceprop=-1;
+        cm.CenterOfMass[0]=pc_com.x; cm.CenterOfMass[1]=pc_com.y; cm.CenterOfMass[2]=pc_com.z;
+        cm.MomentsOfInertia[0]=pi[0]; cm.MomentsOfInertia[1]=pi[1]; cm.MomentsOfInertia[2]=pi[2];
+        cm.ProductsOfInertia[0]=pi[3]; cm.ProductsOfInertia[1]=pi[4]; cm.ProductsOfInertia[2]=pi[5];
+        mesh_bounds(pc,&pmn,&pmx);
+        cm.AABBMin[0]=pmn.x; cm.AABBMin[1]=pmn.y; cm.AABBMin[2]=pmn.z;
+        cm.AABBMax[0]=pmx.x; cm.AABBMax[1]=pmx.y; cm.AABBMax[2]=pmx.z;
+        memcpy(&cm.iMass,&fm,4);
+        cm_at=W.b.size; buf_put(&W.b,&cm,sizeof cm);
+        v_at=buf_pad(&W.b,4);
+        for (k=0;k<(int)pc->nv;k++) {
+          mstudiocollisionmeshvert_t cv; vec3d_t d;
+          memset(&cv,0,sizeof cv);
+          cv.bone=0; cv.group=0; cv.origin=mid; cv.vert=pc->v[k];
+          v_sub(pc->v[k],mid,&d); v_norm(&d); cv.normal=d;
+          cv.dist=v_dot(d,pc->v[k]);
+          buf_put(&W.b,&cv,sizeof cv);
+        }
+        t_at=buf_pad(&W.b,4);
+        for (k=0;k<(int)pc->nt;k++) {
+          mstudiocollisionmodeltri_t ct;
+          memset(&ct,0,sizeof ct);
+          ct.index=(int)(cv_run+0); ct.vertindex=(int)(cv_run+0);
+          ct.parent=-1; ct.next=-1;
+          buf_put(&W.b,&ct,sizeof ct);
+          cv_run+=3;
+        }
+        patch32(&W.b,cm_at+offsetof(mstudiocollisionmodel_c_t,vertoffset),(int)v_at);
+        patch32(&W.b,cm_at+offsetof(mstudiocollisionmodel_c_t,vertparent),(int)v_at);
+        patch32(&W.b,cm_at+offsetof(mstudiocollisionmodel_c_t,faceoffset),(int)t_at);
+        patch32(&W.b,cm_at+offsetof(mstudiocollisionmodel_c_t,edgetrimoffset),(int)v_at);
+      } }
+
+    /* 17. legacy triangles lump */
+    tri_off=buf_pad(&W.b,4);
+    { mstudiotriangle_t t; unsigned int vrun=0;
+      for (i=0;i<(unsigned int)total_lods;i++) {
+        const mesh_t *m=(i==0)?vis:lods[i-1]; unsigned int k;
+        for (k=0;k<m->nt;k++) {
+          memset(&t,0,sizeof t);
+          t.count=3;
+          t.index[0]=(int)(vrun+m->tri[k*3+0]);
+          t.index[1]=(int)(vrun+m->tri[k*3+1]);
+          t.index[2]=(int)(vrun+m->tri[k*3+2]);
+          t.id=(int)k;
+          buf_put(&W.b,&t,sizeof t);
+        }
+        vrun+=m->nv; total_tris+=m->nt;
+      } }
+
+    /* 18. legacy vertices lump */
+    vert_off=buf_pad(&W.b,4);
+    { mstudiovertex_t v;
+      for (i=0;i<(unsigned int)total_lods;i++) {
+        const mesh_t *m=(i==0)?vis:lods[i-1]; unsigned int k;
+        for (k=0;k<m->nv;k++) {
+          memset(&v,0,sizeof v);
+          v.pos=m->v[k]; v.weight[0]=1.0f;
+          v.bone[0]=0; v.bone[1]=v.bone[2]=v.bone[3]=-1;
+          buf_put(&W.b,&v,sizeof v);
+        }
+        total_verts+=m->nv;
+      } }
+
+    /* 19. normals lump */
+    norm_off=buf_pad(&W.b,4);
+    for (i=0;i<(unsigned int)total_lods;i++) {
+        const mesh_t *m=(i==0)?vis:lods[i-1]; unsigned int k;
+        for (k=0;k<m->nv;k++) buf_putvec(&W.b,m->n[k]);
     }
 
-    /* ---------------- bones: root + per-collision-piece bone --------- */
-    {
-        mstudiobone_c_t bone;
-        long bones_off;
-        int nbones = 1 + phys->npieces;
-        memset(&bone, 0, sizeof(bone));
-        bones_off = buf_pad(&W.b, 4);
-        patch32(&W.b, offsetof(studiohdr_c_t, bbonecount), nbones);
-        patch32(&W.b, offsetof(studiohdr_c_t, bboneoffset), (int)bones_off);
-        patch32(&W.b, offsetof(studiohdr_c_t, cbonecount), nbones);
-        patch32(&W.b, offsetof(studiohdr_c_t, cboneoffset), (int)bones_off);
+    /* 20. tangents lump */
+    tan_off=buf_pad(&W.b,4);
+    { vec3d_t tg={1,0,0}; unsigned int k;
+      for (k=0;k<total_verts;k++) buf_putvec(&W.b,tg); }
 
-        /* root bone at identity, centered like studiomdl does for props */
-        bone.sznameindex = put_str(&W, "ValveBiped.Bip01");
-        bone.parent = -1;
-        bone.physicsbone = 0;
-        bone.rotaxis = 0; bone.boneflags = BONE_ALWAYSLAST | BONE_USED_BY_BC;
-        {
-            float *m = &bone.poseToBone[0][0];
-            m[0]=1; m[5]=1; m[10]=1; m[15]=0;
-            m[1]=0; m[2]=0; m[3]=-(mn.x+mx.x)*0.5f;
-            m[4]=0; m[5]=1; m[6]=0; m[7]=-(mn.y+mx.y)*0.5f;
-            m[8]=0; m[9]=0; m[10]=1; m[11]=-(mn.z+mx.z)*0.5f;
-        }
-        buf_put(&W.b, &bone, sizeof(bone));
+    /* 21. UV lump */
+    uv_off=buf_pad(&W.b,4);
+    { mstudiovertexuv_t uv; unsigned int k;
+      memset(&uv,0,sizeof uv);
+      for (k=0;k<total_verts;k++) buf_put(&W.b,&uv,sizeof uv); }
 
-        for (i = 0; i < phys->npieces; i++) {
-            char nm[64];
-            snprintf(nm, sizeof(nm), "physpiece%ld", i);
-            memset(&bone, 0, sizeof(bone));
-            bone.sznameindex = put_str(&W, nm);
-            bone.parent = 0;
-            bone.physicsbone = 0;
-            bone.rotaxis = 0;
-            bone.boneflags = BONE_USED_BY_PHYSICS | BONE_CONFIG;
-            {
-                float *m = &bone.poseToBone[0][0];
-                m[0]=1; m[5]=1; m[10]=1;
-                m[3]=0; m[7]=0; m[11]=0;
-                m[1]=m[2]=m[4]=m[6]=m[8]=m[9]=0;
-                m[12]=m[13]=m[14]=m[15]=0;
-                /* engine expects row-major 3x4 affine stored as [3][4] */
-                m[0]=1;m[1]=0;m[2]=0;m[3]=0;
-                m[4]=0;m[5]=1;m[6]=0;m[7]=0;
-                m[8]=0;m[9]=0;m[10]=1;m[11]=0;
-                m[12]=0;m[13]=0;m[14]=0;m[15]=0;
-            }
-            buf_put(&W.b, &bone, sizeof(bone));
-        }
+    /* 22. empty fixup lump */
+    fix_off=buf_pad(&W.b,4);
+    patch32(&W.b,offsetof(studiohdr_c_t,unused1),(int)fix_off);
+
+    /* patch model totals & mesh pointers */
+    { unsigned int vrun=0,trun=0;
+      for (i=0;i<(unsigned int)total_lods;i++) {
+        long ma=lod_mesh_at[i];
+        long vo=vert_off+(long)vrun*(long)sizeof(mstudiovertex_t);
+        long to=tri_off +(long)trun*(long)sizeof(mstudiotriangle_t);
+        long no=norm_off +(long)vrun*12;
+        long ta=tan_off +(long)vrun*12;
+        long uvo=uv_off +(long)vrun*(long)sizeof(mstudiovertexuv_t);
+        patch32(&W.b,ma+offsetof(mstudiomesh_c_t,meshvertexdata),(int)(ma+8));
+        patch32(&W.b,ma+offsetof(mstudiomesh_c_t,vertexoffset),(int)vo);
+        patch32(&W.b,ma+offsetof(mstudiomesh_c_t,verts),(int)vo);
+        patch32(&W.b,ma+offsetof(mstudiomesh_c_t,triangleoffset),(int)to);
+        patch32(&W.b,ma+offsetof(mstudiomesh_c_t,normoffset),(int)no);
+        patch32(&W.b,ma+offsetof(mstudiomesh_c_t,tangentoffset),(int)ta);
+        patch32(&W.b,ma+offsetof(mstudiomesh_c_t,uvoffset),(int)uvo);
+        vrun+=lod_nvert[i]; trun+=lod_ntri[i];
+      }
+      patch32(&W.b,model_off+offsetof(mstudiomodel_c_t,modelvertexcount),(int)total_verts);
+      patch32(&W.b,model_off+offsetof(mstudiomodel_c_t,vertexoffset),(int)vert_off);
+      patch32(&W.b,model_off+offsetof(mstudiomodel_c_t,triangleoffset),(int)tri_off);
+      patch32(&W.b,model_off+offsetof(mstudiomodel_c_t,trianglecount),(int)total_tris);
+      patch32(&W.b,model_off+offsetof(mstudiomodel_c_t,vertexdata),(int)vert_off);
+      patch32(&W.b,model_off+offsetof(mstudiomodel_c_t,normalscount),(int)total_verts);
+      patch32(&W.b,model_off+offsetof(mstudiomodel_c_t,normoffset),(int)norm_off);
+      patch32(&W.b,model_off+offsetof(mstudiomodel_c_t,tangentscount),(int)total_verts);
+      patch32(&W.b,model_off+offsetof(mstudiomodel_c_t,tangentoffset),(int)tan_off);
+      patch32(&W.b,model_off+offsetof(mstudiomodel_c_t,uvcount),(int)total_verts);
+      patch32(&W.b,model_off+offsetof(mstudiomodel_c_t,uvoffset),(int)uv_off);
+      patch32(&W.b,model_off+offsetof(mstudiomodel_c_t,keyvalueindex),(int)(kv_off-model_off));
     }
 
-    /* ---------------- controllers: one yaw for studiomdl compat ------- */
-    {
-        mstudiobonecontroller_c_t bc[3];
-        long off;
-        memset(bc, 0, sizeof(bc));
-        off = buf_pad(&W.b, 4);
-        bc[0].bone = 0; bc[0].base = -(mn.x+mx.x)*0.5f; bc[0].smooth = 0;
-        bc[1].bone = 0; bc[1].base = -(mn.y+mx.y)*0.5f; bc[1].smooth = 0;
-        bc[2].bone = 0; bc[2].base = -(mn.z+mx.z)*0.5f; bc[2].smooth = 0;
-        /* studiomdl always emits exactly 3 translation controllers for
-         * $staticprop-less models; keep it but mark unused type via pad */
-        buf_put(&W.b, bc, sizeof(bc));
-        patch32(&W.b, offsetof(studiohdr_c_t, bcontrollercount), 3);
-        patch32(&W.b, offsetof(studiohdr_c_t, bcontrolleroffset), (int)off);
-        patch32(&W.b, offsetof(studiohdr_c_t, ccontrollercount), 3);
-        patch32(&W.b, offsetof(studiohdr_c_t, ccontrolleroffset), (int)off);
-        /* give them names in stringtable via lookups embedded in keydata */
-    }
+    /* header tail + eye position */
+    { vec3d_t eye={mid.x,mid.y,mid.z};
+      memcpy(W.b.data+offsetof(studiohdr_c_t,eyeposition),&eye,sizeof eye);
+      patch32(&W.b,offsetof(studiohdr_c_t,usedcount),0);
+      patch32(&W.b,offsetof(studiohdr_c_t,maxscale),0);
+      patch32(&W.b,offsetof(studiohdr_c_t,cinfluencecount),0);
+      patch32(&W.b,offsetof(studiohdr_c_t,cinfluenceoffset),0);
+      patch32(&W.b,offsetof(studiohdr_c_t,hostablecount),0);
+      patch32(&W.b,offsetof(studiohdr_c_t,hostableoffset),(int)loff_off);
+      patch32(&W.b,offsetof(studiohdr_c_t,bmotioncount),(int)coll_off);
+      patch32(&W.b,offsetof(studiohdr_c_t,bmotionoffset),(int)coll_off); }
 
-    /* ---------------- textures --------------------------------------- */
-    {
-        mstudiotexture_c_t tx;
-        mstudiotexturedata_c_t td;
-        long toff, doff;
-        memset(&tx, 0, sizeof(tx));
-        toff = buf_pad(&W.b, 4);
-        tx.name = put_str(&W, o->material);
-        tx.flags = 0;
-        tx.width = 1; tx.height = 1; tx.depth = 1;
-        tx.numframes = 1;
-        { float bbox = 0.0f; memcpy(&tx.bbox, &bbox, 4); }
-        tx.unpackedsize = 4; /* single RGBA8 pixel of a placeholder */
-        buf_put(&W.b, &tx, sizeof(tx));
-        patch32(&W.b, offsetof(studiohdr_c_t, btexturecount), 1);
-        patch32(&W.b, offsetof(studiohdr_c_t, btextureoffset), (int)toff);
-        patch32(&W.b, offsetof(studiohdr_c_t, ctexturecount), 1);
-        patch32(&W.b, offsetof(studiohdr_c_t, ctextureoffset), (int)toff);
+    /* strings at EOF, then length/checksum */
+    { long slen; const unsigned char *sdat; studiohdr_c_t *h;
+      memcpy(W.b.data,IDSTUDIOHEADER,4);
+      patch32(&W.b,offsetof(studiohdr_c_t,version),STUDIOHDR_VERSION);
+      strncpy((char*)W.b.data+offsetof(studiohdr_c_t,name),o->out,MDL_MAX_NAME-1);
+      sdat=str_table_data(&slen);
+      buf_pad(&W.b,4); buf_put(&W.b,sdat,slen);
+      h=(studiohdr_c_t*)W.b.data;
+      h->length=(int)W.b.size;
+      patch32(&W.b,offsetof(studiohdr_c_t,checksum),(int)crc32_buf(W.b.data,W.b.size)); }
 
-        doff = buf_pad(&W.b, 16);
-        memset(&td, 0, sizeof(td));
-        td.imageoffset = (int)(doff + sizeof(td));
-        td.imagesize = 4;
-        td.uncompressedsize = 4;
-        buf_put(&W.b, &td, sizeof(td));
-        { unsigned int px = 0xFF808080u; buf_put(&W.b, &px, 4); } /* grey */
-        patch32(&W.b, offsetof(studiohdr_c_t, ctexturedatacount), 1);
-        patch32(&W.b, offsetof(studiohdr_c_t, ctexturedataoffset), (int)doff);
-    }
+    f=fopen(mdlpath,"wb");
+    if(!f){ERR("cannot open %s",mdlpath);buf_free(&W.b);return -1;}
+    fwrite(W.b.data,1,W.b.size,f); fclose(f);
+    INFO("wrote %s (%ld bytes: %u verts / %u tris visual, %d LOD(s), %d phys piece(s))",
+         mdlpath,W.b.size,total_verts,total_tris,total_lods,phys->npieces);
 
-    /* ---------------- body parts / models / meshes -------------------- */
-    {
-        mstudiobodyparts_c_t bp;
-        mstudio_model_t models[8];
-        memset(&bp, 0, sizeof(bp));
-        memset(models, 0, sizeof(models));
-        bp.nummodels = total_lods;
-        bp.base = buf_pad(&W.b, 4);
-        strncpy(bp.name, "runtime", MDL_MAX_NAME-1);
-        patch32(&W.b, offsetof(studiohdr_c_t, tskinrefcount), 1);
-        {
-            long sk;
-            sk = buf_pad(&W.b, 4);
-            buf_putf(&W.b, 1.0f); /* one skin, scale 1 */
-            patch32(&W.b, offsetof(studiohdr_c_t, tskinoffset), (int)sk);
+    /* ================================ VVD file ====================== */
+    { buf_t vb; vvdheader_c_t vh; virtualmeshfixupheader_t fh;
+      unsigned int t_global=0;
+      long vo,to,la,trn,rn,ma2;
+      buf_init(&vb);
+      memset(&vh,0,sizeof vh);
+      memcpy(vh.id,"VVD1",4);
+      vh.version=VVD_VERSION;
+      strcpy(vh.meshdesc.name,"vMeshDesc");
+      buf_put(&vb,&vh,sizeof vh);
+
+      memset(&fh,0,sizeof fh);
+      strcpy(fh.name,"vFixupInfo"); fh.size=(int)sizeof fh;
+      buf_pad(&vb,4); buf_put(&vb,&fh,sizeof fh);
+
+      buf_pad(&vb,4); vo=vb.size;
+      for (i=0;i<(unsigned int)total_lods;i++) {
+        const mesh_t *m=(i==0)?vis:lods[i-1]; unsigned int k;
+        for (k=0;k<m->nv;k++) {
+          vvdvertex_c_t vv;
+          memset(&vv,0,sizeof vv);
+          vv.weight[0]=1.0f;
+          vv.bone[0]=0; vv.bone[1]=vv.bone[2]=vv.bone[3]=(unsigned char)-1;
+          vv.numbones=1;
+          vv.pos=m->v[k]; vv.normal=m->n[k];
+          buf_put(&vb,&vv,sizeof vv);
         }
+      }
+      patch32(&vb,offsetof(vvdheader_c_t,meshdesc.vertexes),(int)vo);
+      patch32(&vb,offsetof(vvdheader_c_t,meshdesc.vertexsize),48);
 
-        /* reserve model array */
-        model_offset = buf_pad(&W.b, 4);
-        buf_put(&W.b, models, sizeof(mstudio_model_t) * total_lods);
-
-        /* now emit each LOD: mesh descriptor(s) + vertex/tri/norm/tan data */
-        for (i = 0; i < total_lods; i++) {
-            const mesh_t *mm = (i == 0) ? vis : lods[i-1];
-            long meshdesc_off, vd_off, tr_off, nm_off, tg_off;
-            mstudiomesh_c_t mesh;
-            unsigned int vi;
-
-            memset(&mesh, 0, sizeof(mesh));
-            mesh.material = 0;
-            mesh.flags = MESH_FLAG_DRAWABLE | MESH_FLAG_CASTS_SHADOW;
-            mesh.skinref = 0;
-            mesh.modelradius = 0;
-            mesh.numsamples_unused = 0;
-
-            /* mesh struct first */
-            meshdesc_off = buf_pad(&W.b, 4);
-            /* placeholders written below after we know data offsets */
-            buf_put(&W.b, &mesh, sizeof(mesh));
-
-            /* vertices: mstudiovertex_t layout on disk =
-             * float weights[4] + char bone[4] + Vector pos + Vector normal
-             * + Vector2D uv  => our vvdvertex_c_t (48 bytes) */
-            vd_off = buf_pad(&W.b, 16);
-            for (vi = 0; vi < mm->nv; vi++) {
-                vvdvertex_c_t v;
-                memset(&v, 0, sizeof(v));
-                v.weight[0] = 1.0f; v.weight[1] = 0; v.weight[2] = 0; v.weight[3] = 0;
-                v.bone[0] = 0; v.bone[1] = 0; v.bone[2] = 0; v.bone[3] = 0;
-                v.numbones = 1;
-                v.pos = mm->v[vi];
-                /* center about root pivot like studiomdl does */
-                v.normal = mm->n ? mm->n[vi] : (vec3d_t){0,1,0};
-                v.u = (mm->v[vi].x - mn.x) / ((mx.x-mn.x)>1e-6f?(mx.x-mn.x):1.0f);
-                v.v = (mm->v[vi].z - mn.z) / ((mx.z-mn.z)>1e-6f?(mx.z-mn.z):1.0f);
-                buf_put(&W.b, &v, sizeof(v));
-            }
-            tr_off = buf_pad(&W.b, 4);
-            for (vi = 0; vi < mm->nt; vi++) {
-                unsigned short idx[4];
-                idx[0] = (unsigned short)mm->tri[vi*3];
-                idx[1] = (unsigned short)mm->tri[vi*3+1];
-                idx[2] = (unsigned short)mm->tri[vi*3+2];
-                idx[3] = 0; /* studiomdl writes 4 shorts per tri (pad) */
-                buf_put(&W.b, idx, sizeof(idx));
-            }
-            nm_off = buf_pad(&W.b, 16);
-            for (vi = 0; vi < mm->nv; vi++) {
-                vec3d_t nn = mm->n ? mm->n[vi] : (vec3d_t){0,1,0};
-                buf_put(&W.b, &nn, sizeof(nn));
-            }
-            tg_off = buf_pad(&W.b, 16);
-            for (vi = 0; vi < mm->nv; vi++) {
-                vec3d_t nn = mm->n ? mm->n[vi] : (vec3d_t){0,1,0};
-                vec3d_t tv, tt;
-                vec3d_t up = {0,1,0}, ref = fabsf(nn.y) > 0.99f ? (vec3d_t){1,0,0} : up;
-                v_cross(ref, nn, &tv); v_norm(&tv);
-                tt = tv;
-                { vec4d_t q; q.x=tt.x; q.y=tt.y; q.z=tt.z; q.w=1.0f; buf_put(&W.b,&q,sizeof(q)); }
-            }
-
-            /* patch mesh descriptor */
-            {
-                mstudiomesh_c_t mp;
-                memset(&mp, 0, sizeof(mp));
-                mp.vertexoffset = (int)vd_off;
-                mp.vertexcount  = (int)mm->nv;
-                mp.triangleoffset = (int)tr_off;
-                mp.trianglecount  = (int)mm->nt;
-                mp.phoneshadeoffset = (int)nm_off;
-                mp.phoneshadecount  = (int)mm->nv;
-                mp.tangentoffset = (int)tg_off;
-                mp.tangentcount  = (int)mm->nv;
-                mp.material = 0;
-                mp.flags = MESH_FLAG_DRAWABLE | MESH_FLAG_CASTS_SHADOW;
-                mp.skinref = 0;
-                {
-                    float rad = v_len((vec3d_t){(mx.x-mn.x)*0.5f,(mx.y-mn.y)*0.5f,(mx.z-mn.z)*0.5f});
-                    mp.modelradius = rad;
-                }
-                W.b.data; /* ensure */
-                memcpy(W.b.data + meshdesc_off, &mp, sizeof(mp));
-            }
-
-            lod_offsets[i] = meshdesc_off;
-            lod_voff[i] = total_verts;
-            lod_nvert[i] = mm->nv;
-            lod_ntri[i] = mm->nt;
-            total_verts += mm->nv;
-            total_tris  += mm->nt;
-            (void)lod_tri_offs;
+      buf_pad(&vb,4); to=vb.size;
+      for (i=0;i<(unsigned int)total_lods;i++) {
+        const mesh_t *m=(i==0)?vis:lods[i-1]; unsigned int k;
+        for (k=0;k<m->nt;k++) {
+          unsigned short s0,s1,s2; int pad=0;
+          s0=(unsigned short)m->tri[k*3+0];
+          s1=(unsigned short)m->tri[k*3+1];
+          s2=(unsigned short)m->tri[k*3+2];
+          buf_put(&vb,&s0,2); buf_put(&vb,&s0,2);
+          buf_put(&vb,&s1,2); buf_put(&vb,&s1,2);
+          buf_put(&vb,&s2,2); buf_put(&vb,&s2,2);
+          buf_put(&vb,&pad,4);
+          t_global++;
         }
+      }
+      patch32(&vb,offsetof(vvdheader_c_t,meshdesc.triangles),(int)to);
+      patch32(&vb,offsetof(vvdheader_c_t,meshdesc.trianglecount),(int)t_global);
 
-        /* patch model array entries */
-        for (i = 0; i < total_lods; i++) {
-            mstudio_model_t mv;
-            memset(&mv, 0, sizeof(mv));
-            mv.name = put_str(&W, "LOD");
-            mv.bodyPart = 0;
-            mv.deformable = 0;
-            mv.meshcount = 1;
-            mv.meshoffset = (int)lod_offsets[i];
-            mv.vertexoffset = (int)lod_voff[i];
-            mv.vertexcount = (int)lod_nvert[i];
-            mv.tangentscount = (int)lod_nvert[i];
-            mv.modelindex = (int)i;
-            mv.localmesh = -1;
-            mv.bulkDataFlags = 0;
-            mv.vertBaseSize = 48;
-            mv.vertex_size = 48;
-            mv.tangent_size = 16;
-            mv.info.lod = (int)i;
-            memcpy(W.b.data + model_offset + sizeof(mstudio_model_t)*i, &mv, sizeof(mv));
+      buf_pad(&vb,4); la=vb.size;
+      { virtualmeshlods_t vl; unsigned int voff=0,toff=0;
+        for (i=0;i<(unsigned int)total_lods;i++) {
+          memset(&vl,0,sizeof vl);
+          vl.vertexoffset=(int)voff; vl.vertexcount=(int)lod_nvert[i];
+          vl.triangleoffset=(int)toff; vl.trianglecount=(int)lod_ntri[i];
+          buf_put(&vb,&vl,sizeof vl);
+          voff+=lod_nvert[i]; toff+=lod_ntri[i];
         }
+        patch32(&vb,offsetof(vvdheader_c_t,meshdesc.lod),(int)la);
+        patch32(&vb,offsetof(vvdheader_c_t,meshdesc.lodcount),total_lods); }
 
-        /* bodyparts entry */
-        {
-            mstudiobodyparts_c_t bpe;
-            memset(&bpe, 0, sizeof(bpe));
-            bpe.nummodels = total_lods;
-            bpe.base = (int)model_offset;
-            bpe.testbase = 0;
-            bpe.testgroup = -1;
-            strncpy(bpe.name, "runtime", MDL_MAX_NAME-1);
-            memcpy(W.b.data + bp.base, &bpe, sizeof(bpe));
-            patch32(&W.b, offsetof(studiohdr_c_t, bodypartcount), 1);
-            patch32(&W.b, offsetof(studiohdr_c_t, bodypartoffset), (int)bp.base);
+      buf_pad(&vb,4); trn=vb.size;
+      { virtualmeshtransition_t vt;
+        for (i=0;i<(unsigned int)total_lods;i++) {
+          memset(&vt,0,sizeof vt);
+          vt.lodlevel=(int)i;
+          vt.loderror=(int)(lod_err[i]*100000.0f);
+          buf_put(&vb,&vt,sizeof vt);
         }
-    }
+        patch32(&vb,offsetof(vvdheader_c_t,meshdesc.transition),(int)trn);
+        patch32(&vb,offsetof(vvdheader_c_t,meshdesc.transitioncount),total_lods); }
 
-    /* ---------------- collision models (physics transfer) ------------- */
-    collision_info_off = 0;
-    {
-        long ci_off;
-        int ncol = phys->npieces;
-        /* mstudiocollisioninfo-style table: studiomdl writes
-         * collisionmodelinfo at end; we use the classic v48 layout:
-         * hdr.collisionmap? No - Ep2 stores collisions inside PHYS file or
-         * inline when $collisionmodels... For maximum compatibility we
-         * inline them and point hdr fields. */
-        ci_off = buf_pad(&W.b, 16);
-        collision_info_off = ci_off;
-        /* count of convex pieces stored as: [ncol][offset-of-array] */
-        buf_puti(&W.b, ncol);
-        buf_puti(&W.b, (int)(ci_off + 8));
-        {
-            long arr = ci_off + 8;
-            for (i = 0; i < ncol; i++) {
-                const mesh_t *pc = phys->pieces[i];
-                long vs, ts, rec;
-                mstudiocollisionmodel_c_t cm; /* our compact record */
-                memset(&cm, 0, sizeof(cm));
-                rec = buf_pad(&W.b, 4);
-                /* reserve record, patch later */
-                { studiohdr_c_t z2; memset(&z2,0,sizeof(z2)); (void)z2; }
-                buf_put(&W.b, &cm, sizeof(cm));
+      buf_pad(&vb,4); rn=vb.size;
+      { vec3d_t up={0,0,1}; buf_put(&vb,&up,sizeof up);
+        patch32(&vb,offsetof(vvdheader_c_t,meshdesc.rootnormal),(int)rn);
+        patch32(&vb,offsetof(vvdheader_c_t,meshdesc.rootnormalcount),1); }
 
-                vs = buf_pad(&W.b, 4);
-                for (j = 0; j < (long)pc->nv; j++) {
-                    mstudiocollisionmeshvert_t cv;
-                    memset(&cv, 0, sizeof(cv));
-                    cv.bone = -1;
-                    cv.vec = pc->v[j];
-                    buf_put(&W.b, &cv, sizeof(cv));
-                }
-                ts = buf_pad(&W.b, 4);
-                for (j = 0; j < (long)pc->nt; j++) {
-                    mstudiocollisionmodeltri_t ct;
-                    memset(&ct, 0, sizeof(ct));
-                    ct.edge[0] = (unsigned short)pc->tri[j*3];
-                    ct.edge[1] = (unsigned short)pc->tri[j*3+1];
-                    ct.edge[2] = (unsigned short)pc->tri[j*3+2];
-                    ct.face = 0;
-                    buf_put(&W.b, &ct, sizeof(ct));
-                }
-                /* patch this piece's record */
-                memset(&cm, 0, sizeof(cm));
-                cm.type = 7; /* CONVEX */
-                cm.count = (int)pc->nv;
-                cm.vertoffset = (int)vs;
-                cm.vertparent = -1;
-                cm.trioffset = (int)ts;
-                cm.tricount = (int)pc->nt;
-                {
-                    vec3d_t pmn, pmx;
-                    mesh_bounds(pc, &pmn, &pmx);
-                    cm.Slab[0]=pmn.x; cm.Slab[1]=pmn.y; cm.Slab[2]=pmn.z;
-                    /* Slab is min; store max into AABBMax-like fields below */
-                    cm.aabbMin[0]=pmn.x; cm.aabbMin[1]=pmn.y; cm.aabbMin[2]=pmn.z;
-                    cm.aabbMax[0]=pmx.x; cm.aabbMax[1]=pmx.y; cm.aabbMax[2]=pmx.z;
-                }
-                cm.iCenterMass[0]=phys->com.x; cm.iCenterMass[1]=phys->com.y; cm.iCenterMass[2]=phys->com.z;
-                cm.Mass = phys->mass;
-                cm.MomentsOfInertia[0]=phys->inertia[0];
-                cm.MomentsOfInertia[1]=phys->inertia[1];
-                cm.MomentsOfInertia[2]=phys->inertia[2];
-                cm.ProductsOfInertia[0]=phys->inertia[3];
-                cm.ProductsOfInertia[1]=phys->inertia[4];
-                cm.ProductsOfInertia[2]=phys->inertia[5];
-                memcpy(W.b.data + rec, &cm, sizeof(cm));
-                patch32(&W.b, arr + i*4, (int)rec);
-            }
-        }
-    }
+      buf_pad(&vb,4); ma2=vb.size;
+      buf_put(&vb,&vh.meshdesc,sizeof(virtualmeshdesc_t));
+      patch32(&vb,offsetof(vvdheader_c_t,meshdesc.mesh),(int)ma2);
+      patch32(&vb,offsetof(vvdheader_c_t,meshdesc.meshcount),1);
 
-    /* ---------------- local hierarchy names --------------------------- */
-    name_off = put_str(&W, "ValveBiped.Bip01");
-    (void)name_off;
+      patch32(&vb,offsetof(vvdheader_c_t,filelen),(int)vb.size);
+      patch32(&vb,offsetof(vvdheader_c_t,checksum),(int)crc32_buf(vb.data,vb.size));
 
-    /* ---------------- string table ------------------------------------ */
-    strings_file_start = buf_pad(&W.b, 16);
-    {
-        long slen; void *sd = str_table_data(&slen);
-        buf_put(&W.b, sd, slen);
-    }
-
-    /* ---------------- finalize header ----------------------------------- */
-    memset(&hdr, 0, sizeof(hdr));
-    memcpy(hdr.id, "IDST", 4);
-    hdr.version = 48;
-    strncpy(hdr.name, basepath, MDL_MAX_NAME-1);
-    hdr.length = (int)W.b.size;
-    { vec3d_t eye = {(mn.x+mx.x)*0.5f, (mn.y+mx.y)*0.5f + (mx.y-mn.y)*0.5f, (mn.z+mx.z)*0.5f};
-      hdr.eyeposition = buf_putf_at(&W.b, 0, eye); } /* patched below */
-    hdr.maxscale = 1.0f;
-    hdr.flags = STUDIOHDR_FLAGS_HITBOX_SET; /* we have no hitboxes; cleared later */
-    hdr.flags = 0;
-    hdr.bbonecount = 1 + phys->npieces;
-    hdr.cbonecount = 1 + phys->npieces;
-    hdr.bcontrollercount = 3; hdr.ccontrollercount = 3;
-    hdr.bmotioncount = 0;
-    hdr.btexturecount = 1; hdr.ctexturecount = 1;
-    hdr.ctexturedatacount = 1;
-    hdr.keydatacount = 0;
-    hdr.bodypartcount = 1;
-    hdr.numedges = 0;
-    hdr.markdataofs = 0;
-    hdr.cinfluencecount = 0;
-    hdr.localanimcount = 0; hdr.localmatrixcount = hdr.bbonecount;
-    hdr.animblocktype = 0; hdr.animblockindex = 0;
-    hdr.translationcount = hdr.bbonecount;
-    hdr.rotationcount = hdr.bbonecount;
-    hdr.bonemerge... /* not present in v48 mirror; skip */
-    memcpy(W.b.data, &hdr, sizeof(hdr));
-
-    /* fix eyeposition: store three floats right after string table */
-    {
-        long ep = buf_pad(&W.b, 4);
-        buf_putf(&W.b, (mn.x+mx.x)*0.5f);
-        buf_putf(&W.b, (mn.y+mx.y)*0.5f);
-        buf_putf(&W.b, (mn.z+mx.z)*0.5f);
-        patch32(&W.b, offsetof(studiohdr_c_t, eyeposition), (int)ep);
-        hdr.length = (int)W.b.size;
-        memcpy(W.b.data, &hdr, sizeof(hdr));
-    }
-
-    /* checksum over everything except the checksum field itself */
-    {
-        unsigned int c = crc32_buf(W.b.data + 8, W.b.size - 8);
-        patch32(&W.b, offsetof(studiohdr_c_t, checksum), (int)c);
-    }
-
-    /* ---------------- write MDL ---------------------------------------- */
-    f = fopen(mdlpath, "wb");
-    if (!f) { ERR("cannot write %s", mdlpath); return 0; }
-    fwrite(W.b.data, 1, W.b.size, f);
-    fclose(f);
-    INFO("wrote %s (%ld bytes)", mdlpath, W.b.size);
-
-    /* ---------------- VVD ---------------------------------------------- */
-    {
-        vvdheader_c_t vh;
-        virtualmeshdesc_t md;
-        long vbase, tbase, nbase, tgbase, fdstart;
-        unsigned int vi;
-        buf_t vb; buf_init(&vb);
-
-        memset(&vh, 0, sizeof(vh));
-        memcpy(vh.id, "VVD1", 4);
-        vh.version = 4;
-        buf_put(&vb, &vh, sizeof(vh));
-
-        memset(&md, 0, sizeof(md));
-        md.vertexes = buf_pad(&vb, 16);
-        vbase = md.vertexes;
-        for (i = 0; i < total_lods; i++) {
-            const mesh_t *mm = (i==0)?vis:lods[i-1];
-            for (vi = 0; vi < mm->nv; vi++) {
-                vvdvertex_c_t v;
-                memset(&v, 0, sizeof(v));
-                v.weight[0]=1.0f; v.bone[0]=0; v.numbones=1;
-                v.pos = mm->v[vi];
-                v.normal = mm->n ? mm->n[vi] : (vec3d_t){0,1,0};
-                v.u = 0; v.v = 0;
-                buf_put(&vb, &v, sizeof(v));
-            }
-        }
-        md.vertexsize = (int)(vb.size - vbase);
-
-        md.triangles = buf_pad(&vb, 4);
-        tbase = md.triangles;
-        {
-            unsigned int global_vbase = 0;
-            for (i = 0; i < total_lods; i++) {
-                const mesh_t *mm = (i==0)?vis:lods[i-1];
-                for (vi = 0; vi < mm->nt; vi++) {
-                    unsigned short q[4];
-                    q[0]=(unsigned short)(mm->tri[vi*3]+global_vbase);
-                    q[1]=(unsigned short)(mm->tri[vi*3+1]+global_vbase);
-                    q[2]=(unsigned short)(mm->tri[vi*3+2]+global_vbase);
-                    q[3]=0;
-                    buf_put(&vb, q, sizeof(q));
-                }
-                global_vbase += mm->nv;
-            }
-        }
-        md.trianglecount = (int)total_tris;
-
-        md.lod = buf_pad(&vb, 4);
-        {
-            long lb = md.lod;
-            for (i = 0; i < total_lods; i++) {
-                virtualmeshlods_t vl;
-                memset(&vl, 0, sizeof(vl));
-                vl.lodlevel = (int)i;
-                vl.baseVertex = (int)lod_voff[i];
-                vl.vertexCount = (int)lod_nvert[i];
-                vl.baseTriangle = 0; /* computed below cumulatively */
-                {
-                    unsigned int cum = 0, k;
-                    for (k = 0; k < (unsigned int)i; k++) cum += lod_ntri[k];
-                    vl.baseTriangle = (int)cum;
-                }
-                vl.triangleCount = (int)lod_ntri[i];
-                buf_put(&vb, &vl, sizeof(vl));
-            }
-            md.lodcount = total_lods;
-            (void)lb;
-        }
-
-        md.rootnormal = buf_pad(&vb, 16);
-        nbase = md.rootnormal;
-        {
-            unsigned int gb = 0;
-            for (i = 0; i < total_lods; i++) {
-                const mesh_t *mm = (i==0)?vis:lods[i-1];
-                for (vi = 0; vi < mm->nv; vi++) {
-                    virtualmeshrootnormal_t rn;
-                    memset(&rn, 0, sizeof(rn));
-                    rn.m_vecNormal = mm->n ? mm->n[vi] : (vec3d_t){0,1,0};
-                    rn.m_flArea = 0;
-                    rn.m_iFirstRef = (int)gb + (int)vi;
-                    rn.m_iLastRef = (int)gb + (int)vi;
-                    buf_put(&vb, &rn, sizeof(rn));
-                }
-                gb += mm->nv;
-            }
-            md.rootnormalcount = (int)total_verts;
-        }
-        (void)nbase;
-
-        md.fixup = buf_pad(&vb, 16);
-        {
-            virtualmeshfixupheader_t fh;
-            memset(&fh, 0, sizeof(fh));
-            fh.fixupcount = 0;
-            fh.mass = 0;
-            fh.vertices = 0;
-            fh.triangles = 0;
-            fh.vertfixup = 0;
-            fh.trifixup = 0;
-            fh.name[0] = 0;
-            buf_put(&vb, &fh, sizeof(fh));
-            fdstart = vb.size;
-            (void)fdstart;
-        }
-        md.fixupcount = 1; /* one (empty) fixup header block */
-
-        /* mesh desc offset: right after header */
-        md.vertexes; /* keep */
-        memcpy(vb.data + sizeof(vvdheader_c_t), &md, sizeof(md));
-        vh.filelen = (int)vb.size;
-        vh.checksum = (int)crc32_buf(vb.data + 8, vb.size - 8);
-        memcpy(vb.data, &vh, sizeof(vh));
-
-        f = fopen(vvdpath, "wb");
-        if (!f) { ERR("cannot write %s", vvdpath); buf_free(&vb); return 0; }
-        fwrite(vb.data, 1, vb.size, f);
-        fclose(f);
-        INFO("wrote %s (%ld bytes)", vvdpath, vb.size);
-        buf_free(&vb);
+      f=fopen(vvdpath,"wb");
+      if(!f){ERR("cannot open %s",vvdpath);buf_free(&vb);buf_free(&W.b);return -1;}
+      fwrite(vb.data,1,vb.size,f); fclose(f);
+      INFO("wrote %s (%ld bytes)",vvdpath,vb.size);
+      buf_free(&vb);
     }
 
     buf_free(&W.b);
-    (void)patch32; (void)strings_file_start; (void)collision_info_off;
-    (void)vertdata_off; (void)norm_off; (void)tan_off; (void)tri_off; (void)tan_off;
-    return 1;
+    return 0;
 }

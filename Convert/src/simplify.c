@@ -38,11 +38,11 @@ static void quad_init(quad_t *Q, const vec3d_t p, const vec3d_t n) {
     Q->q[9]=1.0f;
 }
 
-static float quad_eval(const quad_t *Q, const vec3d_t p) {
+static float quad_eval(const quad_t *Q, const vec3d_t *p) {
     double v =
-        Q->q[0]*p.x*p.x + 2*Q->q[1]*p.x*p.y + 2*Q->q[2]*p.x*p.z + 2*Q->q[3]*p.x +
-              Q->q[4]*p.y*p.y + 2*Q->q[5]*p.y*p.z + 2*Q->q[6]*p.y +
-                    Q->q[7]*p.z*p.z + 2*Q->q[8]*p.z + Q->q[9];
+        Q->q[0]*p->x*p->x + 2*Q->q[1]*p->x*p->y + 2*Q->q[2]*p->x*p->z + 2*Q->q[3]*p->x +
+              Q->q[4]*p->y*p->y + 2*Q->q[5]*p->y*p->z + 2*Q->q[6]*p->y +
+                    Q->q[7]*p->z*p->z + 2*Q->q[8]*p->z + Q->q[9];
     return (float)(v < 0 ? 0 : v);
 }
 

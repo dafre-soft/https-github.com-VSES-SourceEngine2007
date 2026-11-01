@@ -92,6 +92,25 @@ typedef struct { unsigned char b0, b1, b2, b3; } blendweight_c_t;
 #define MASK_PLAYERSOLID                   0x00000001
 
 /* ---------------------------------------------------------------- header */
+#define IDSTUDIOHEADER   "IDST"
+#define IDSTUDIOBONES    "ISTU"
+#define STUDIOHDR_VERSION 48
+#define VVD_VERSION       4
+
+/* texture flags (mstudiotexture_t.flags) */
+#define EX_PERSISTENT_LOWRES     0x1
+#define EX_PERSISTENT_MEDIUMRES  0x2
+#define EX_PERSISTENT_HIGHRES    0x4
+#define EX_RENDER_TARGET         0x8
+#define EX_NO_LIGHTMAP           0x10
+#define EX_PERSISTENT_NORMALMAP  0x20
+
+/* collision model types */
+#define CONCAVE_TILEMODE          1
+#define CONCAVE_OCTREEMODE        2
+#define CONCAVE_STATICMODEL       3
+#define CONCAVE_TYPESPIECEMODE    7
+
 #pragma pack(push, 4)
 
 typedef struct {
@@ -101,10 +120,10 @@ typedef struct {
     char        name[MDL_MAX_NAME];
     intu        length;
     intu        eyeposition;      /* vec3d offset                             */
-    intu        llpix;            /* lighting lookup                            */
-    intu        hlpikm;           /* hull information                           */
-    intu        vmv;              /* view model vertex cache transform elem    */
-    intu        mmv;              /* mutation morph vert cache                  */
+    intu        unused1;          /* (v48: unused)                              */
+    intu        hitboxsetoffset;  /* mstudiohitboxset_t lump                    */
+    intu        simplemodelinfo;  /* mstudiesimplemodelinfo_t lump              */
+    intu        unused2;          /* (v48: unused)                              */
     intu        maxscale;
     intu        flags;
     intu        usedcount;
@@ -128,12 +147,12 @@ typedef struct {
     intu        tlocalorderoffset;
     intu        hostablecount;
     intu        hostableoffset;
-    intu        ckitcount;
-    intu        ckitoffset;
+    intu        collisionmodelinfo_count;
+    intu        collisionmodelinfo_offset;
     intu        ctexturedatacount;
     intu        ctexturedataoffset;
-    intu        texfixedparamscount;
-    intu        texfixedparamsoffset;
+    intu        skinrefcount_unused;
+    intu        skinrefoffset_unused;
     intu        keydatacount;
     intu        keydataoffset;
     intu        cinfluencecount;
@@ -182,22 +201,12 @@ typedef struct {
 } mstudiomovement_c_t;
 
 typedef struct {
-    intu        type;
-    intu        name;
-    intu        texture;
-} mstudiotexture_c_t;
-
-typedef struct {
     intu        texture;
     intu        flags;
     intu        u;
     intu        v;
 } mstudyuvanim_t;
 
-typedef struct {
-    intu        material;
-    intu        flags;
-} mstudiomaterialmod_t;
 
 typedef struct {
     intu        bodypart;
@@ -214,6 +223,65 @@ typedef struct {
     char        name[MDL_MAX_NAME];
     intu        pad;
 } mstudiobodyparts_c_t;
+
+/* mstudiomodel_t - studiohdr v48 layout (write.cpp: WriteModel) */
+typedef struct {
+    char        name[MDL_MAX_NAME];
+    intu        type;
+    intu        bonecontrollercount;      /* always 0 in v48 */
+    intu        bonecontrolleroffset;     /* always 0 in v48 */
+    intu        keyvalueindex;            /* fltim-equivalent offset into modelkeyvalue data */
+    intu        meshcount;
+    intu        meshoffset;
+    intu        modelvertexcount;
+    intu        vertexoffset;             /* lump of mstudiovertex_t (legacy) */
+    intu        trianglecount;
+    intu        triangleoffset;           /* lump of mstudiotriangle_t */
+    intu        skinrefcount;
+    intu        skinoffset;
+    intu        lodcount;
+    intu        lodoffset;
+    intu        bgmcount;                 /* studiohdr >= 41 */
+    intu        bgmoffset;
+    intu        cgmcount;
+    intu        cgmoffset;
+    intu        vertexdata;               /* ModelVertexData_t start */
+    /* ModelVertexData_t (inline): */
+    intu        vertdeformcount;
+    intu        vertdeformoffset;
+    intu        normalscount;
+    intu        normoffset;
+    intu        tangentscount;
+    intu        tangentoffset;
+    fltim       vertdeformstarttime;
+    fltim       vertdeformfinaltime;
+    intu        uvcount;                  /* studiohdr >= 43: mstudiovertexuv_t array */
+    intu        uvoffset;
+} mstudiomodel_c_t;
+
+typedef struct {
+    unsigned short texels[3];
+    short          lightmapofs[3];
+} mstudiovertexuv_t;
+
+typedef struct {
+    intu        count;                    /* always 3 */
+    intu        index[3];
+    intu        flags;
+    intu        id;
+} mstudiotriangle_t;
+
+typedef struct {
+    intu        firstlevel;
+    intu        remaplevel[8];
+    intu        force_material;
+} mstudiomodel_lod_t;
+
+typedef struct {
+    intu        lod;
+    intu        city;
+    intu        _pad[2];
+} mstudiesimplemodelinfo_t;
 
 typedef struct {
     intu        numbones;
@@ -340,30 +408,30 @@ typedef struct {
 
 /* ------------------------------------------------------------- mesh data */
 typedef struct {
-    intu        vertexoffset;
+    char        name[MDL_MAX_NAME];             /* 64 */
+    intu        material;
+    intu        meshvertexdata;                 /* MeshVertexData_t start */
+    /* MeshVertexData_t inline: */
+    intu        vertexoffset;                   /* legacy mstudiovertex_t */
     intu        vertexcount;
     intu        triangleoffset;
     intu        trianglecount;
-    intu        phoneshadeoffset;
-    intu        phoneshadecount;
-    fltim       modelradius;
-    intu        material;
-    intu        flags;
-    intu        skinref;
-    intu        numnormals;
-    intu        numtangents;
-    intu        numverts;
-    intu        verts;
-    intu        vertbasesize;
-    intu        vertexsize;
-    intu        _pad[2];
+    intu        wedgecount;
+    intu        wedgeoffset;
+    intu        fixupcount;
+    intu        fixupoffset;
+    intu        bonetablecount;
+    intu        bonetableoffset;
+    intu        normcount;
+    intu        normoffset;
+    intu        tangentcount;
+    intu        tangentoffset;
+    intu        uvcount;
+    intu        uvoffset;
+    intu        verts;                          /* == vertexoffset */
+    fltim       vertdeformstarttime;
+    fltim       vertdeformfinaltime;
 } mstudiomesh_c_t;
-
-typedef struct {
-    intu        lod;
-    intu        city;
-    intu        _pad[2];
-} mstudiesimplemodelinfo_t;
 
 typedef struct {
     vec3d_t     pos;
@@ -453,7 +521,8 @@ typedef struct {
 /* ------------------------------------------------------------ collision */
 typedef struct {
     intu        type;             /* 7 = convex                                */
-    intu        count;
+    intu        count;            /* triangle count                            */
+    intu        vertcount;
     intu        vertoffset;
     intu        vertparent;
     intu        edgetrimoffset;
@@ -498,18 +567,36 @@ typedef struct {
     intu        sznameindex;
     intu        solid;
     intu        _pad[2];
+} mstudiobonebox_c_t;
+
+typedef struct {
+    char        name[MDL_MAX_NAME];
+    intu        hitboxcount;
+    intu        hitboxoffset;
 } mstudiohitboxset_c_t;
+
+typedef struct {
+    intu        material;
+    intu        flags;
+} mstudiomaterialmod_t;
 
 /* -------------------------------------------------------------- textures */
 typedef struct {
-    intu        width;
-    intu        height;
-    intu        depth;
+    intu        flags;            /* persistent group hdr (unused -> zeros)   */
+    intu        _pad[3];
+} mstudiopersistentgrouphdr_c_t;
+
+typedef struct {
+    char        name[MDL_MAX_NAME];
     intu        flags;
-    intu        numframes;
-    intu        bbox;             /* fltim                                     */
-    intu        unpackedsize;
-    intu        _pad;
+    intu        usage;
+    fltim       bbox[2];
+    intu        texdatacount;
+    intu        texdataoffset;
+    fltim       absorb[3];
+    fltim       scattered[3];
+    intu        material;         /* string table index of full material path */
+    intu        _pad[2];
 } mstudiotexture_c_t;
 
 typedef struct {
