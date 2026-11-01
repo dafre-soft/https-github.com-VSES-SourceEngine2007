@@ -380,9 +380,16 @@ int write_mdl_vvd(const char *basepath, const mesh_t *vis, mesh_t *lods[],
 
     /* strings at EOF, then length/checksum */
     { long slen; const void *sdat; studiohdr_c_t *h;
+      char nm[MDL_MAX_NAME];
+      const char *base = strrchr(o->out, '/');
+      const char *bs2  = strrchr(o->out, '\\');
       memcpy(W.b.data,IDSTUDIOHEADER,4);
       patch32(&W.b,offsetof(studiohdr_c_t,version),STUDIOHDR_VERSION);
-      strncpy((char*)W.b.data+offsetof(studiohdr_c_t,name),o->out,MDL_MAX_NAME-1);
+      /* szname must be the bare model name (no path): strip it. */
+      if (bs2 && (!base || bs2 > base)) base = bs2;
+      strncpy(nm, base ? base + 1 : o->out, MDL_MAX_NAME - 1);
+      nm[MDL_MAX_NAME - 1] = '\0';
+      strncpy((char*)W.b.data+offsetof(studiohdr_c_t,name),nm,MDL_MAX_NAME-1);
       sdat=str_table_data(&slen);
       buf_pad(&W.b,4); buf_put(&W.b,sdat,slen);
       h=(studiohdr_c_t*)W.b.data;

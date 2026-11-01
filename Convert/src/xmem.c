@@ -56,61 +56,120 @@ static void xm_account(size_t oldn, size_t newn, const char *op) {
     (void)op; xm_track(0);
 }
 
-/* We keep our own per-block size header (portable — no malloc_usable_size
- * dependency on Windows) so accounting is exact and frees decrement usage. */
-/* header MUST be max-aligned so any payload type is properly aligned */
-typedef union { size_t n; double _a; void *_p; } xunit_t;
-typedef struct { size_t n; unsigned magic; } xhdr_body;
-static const size_t XHDR = ((sizeof(xhdr_body) + 15u) / 16u) * 16u; /* >=32 on LP64, keep 16-byte align */
-#define XMAGIC 0x5A9E3C17u
-typedef struct { size_t n; unsigned magic; char pad[8]; } xhdr_t;
+/* We keep our own per-block header (portable — no malloc_usable_size
+ * dependency on Windows) so accounting is exact and frees decrement usage.
+ * The payload is ALWAYS at a fixed 16-byte-aligned offset from the raw
+ * malloc block, which makes every operation O(1) and safe:
+ *
+ *   raw block:  [ pad .. | total_size | magic | payload ... ]
+ *   p (user) points to payload; magic lives right before it.
+ *
+ * A pointer is "ours" iff the 4-byte magic just before the payload matches.
+ * Foreign pointers (from libc malloc/realloc/free elsewhere in the code)
+ * are detected and passed through to the C library instead of corrupting
+ * the heap — this was the root cause of the previous crash where physics.c
+ * freed an xm_alloc'd array with plain free().
+ */
+/* Ownership model (no pointer-header tricks):
+ *   - every allocation that MUST be xm-owned is tagged in a small registry;
+ *   - foreign pointers (libc malloc/calloc/realloc from stl.c/buf.c) are
+ *     detected via the registry and passed straight to free()/realloc().
+ * The registry is a 16-bit hash of the pointer into bucketed arrays with
+ * linear probing on collision; lookups are O(1) amortised, which matters
+ * because mesh_free() is called per convex piece during decomposition.
+ */
+#define XBUCKETS 4096
 
-static void *xm_get(size_t n) {           /* raw alloc + retry once */
-    void *p = malloc(n);
-    if (!p) p = malloc(n);                /* retry: OS may reclaim after GC */
+typedef struct xent {
+    void *p;              /* user pointer (payload start) */
+    size_t n;             /* payload size                 */
+    struct xent *next;
+} xent_t;
+
+static xent_t *g_tab[XBUCKETS];
+static xent_t *g_freelist;
+
+static unsigned xb(void *p) {
+    size_t v = (size_t)p;
+    return (unsigned)((v >> 4u) % XBUCKETS);
+}
+
+static xent_t *xent_new(void) {
+    xent_t *e;
+    if (g_freelist) { e = g_freelist; g_freelist = e->next; return e; }
+    e = (xent_t *)malloc(sizeof(xent_t));
+    if (!e) { ERR("%s", xm_oom_msg()); exit(2); }
+    return e;
+}
+
+static void xent_put(xent_t *e) { e->next = g_freelist; g_freelist = e; }
+
+static xent_t *x_find(void *p) {
+    xent_t *e;
+    for (e = g_tab[xb(p)]; e; e = e->next) if (e->p == p) return e;
+    return NULL;
+}
+
+static void x_add(void *p, size_t n) {
+    unsigned b = xb(p);
+    xent_t *e = xent_new();
+    e->p = p; e->n = n; e->next = g_tab[b]; g_tab[b] = e;
+}
+
+static size_t x_del(void *p) {           /* returns stored size, 0 if absent */
+    unsigned b = xb(p);
+    xent_t **pp = &g_tab[b], *e;
+    while (*pp) {
+        e = *pp;
+        if (e->p == p) { *pp = e->next; { size_t n = e->n; xent_put(e); return n; } }
+        pp = &e->next;
+    }
+    return 0;
+}
+
+int xm_owns(const void *p) { return p != NULL && x_find((void*)p) != NULL; }
+
+void *xm_alloc(size_t n) {
+    void *p;
+    if (n == 0) n = 1;
+    p = malloc(n);
+    if (!p) p = malloc(n);               /* transient pressure: retry */
+    if (!p) { ERR("%s", xm_oom_msg()); exit(2); }
+    memset(p, 0, n);
+    x_add(p, n);
+    xm_account(0, n, "alloc");
     return p;
 }
 
-void *xm_alloc(size_t n) {
-    xhdr_t *h;
-    if (n == 0) n = 1;
-    h = (xhdr_t *)xm_get(XHDR + n);
-    if (!h) { ERR("%s", xm_oom_msg()); exit(2); }
-    h->n = n; h->magic = XMAGIC;
-    xm_account(0, n, "alloc");
-    memset((char*)h + XHDR, 0, n);
-    return (char*)h + XHDR;
-}
-
 void *xm_realloc(void *p, size_t n) {
+    size_t oldn;
+    void *r;
     if (n == 0) n = 1;
     if (!p) return xm_alloc(n);
-    else {
-        xhdr_t *h = (xhdr_t *)((char*)p - XHDR);
-        void *q;
-        size_t oldn;
-        if (h->magic != XMAGIC) {         /* foreign pointer: can't track */
-            q = realloc(p, n);
-            if (!q) { ERR("%s", xm_oom_msg()); exit(2); }
-            return q;
-        }
-        oldn = h->n;
-        if (oldn >= n) return p;          /* shrink: keep block, no copy */
-        q = xm_get(XHDR + n);
-        if (!q) { ERR("%s", xm_oom_msg()); exit(2); }
-        memcpy(q, h, XHDR + oldn);
-        free(h);
-        ((xhdr_t*)q)->n = n; ((xhdr_t*)q)->magic = XMAGIC;
-        xm_account(oldn, n, "realloc");
-        return (char*)q + XHDR;
+    oldn = x_del(p);                     /* removes tag if ours, 0 if foreign */
+    if (oldn == 0) {                     /* foreign pointer: plain realloc */
+        r = realloc(p, n);
+        if (!r) { ERR("%s", xm_oom_msg()); exit(2); }
+        return r;
     }
+    r = realloc(p, n);                   /* p was malloc'd by us: safe */
+    if (!r) {                            /* keep original alive + re-tag */
+        r = malloc(n);
+        if (!r) { ERR("%s", xm_oom_msg()); exit(2); }
+        memcpy(r, p, oldn < n ? oldn : n);
+        free(p);
+    }
+    x_add(r, n);
+    xm_account(oldn, n, "realloc");
+    return r;
 }
 
 void xm_free(void *p) {
+    size_t n;
     if (!p) return;
-    {
-        xhdr_t *h = (xhdr_t *)((char*)p - XHDR);
-        if (h->magic == XMAGIC) { xm_account(h->n, 0, "free"); free(h); }
-        else free(p);                     /* foreign pointer (libc malloc) */
-    }
+    n = x_del(p);
+    if (n) xm_account(n, 0, "free");
+    free(p);                             /* both cases: all our blocks came
+                                            from malloc(), so this is valid */
 }
+

@@ -21,7 +21,7 @@ void phys_build(const mesh_t *coll, const opts_t *o, phys_t *p) {
         /* last-resort fallback: single decimated hull */
         mesh_t *h = mesh_convex_hull(coll);
         if (!h) h = mesh_decimate(coll, coll->nt / 2 + 4);
-        pieces = (mesh_t **)malloc(sizeof(mesh_t*));
+        pieces = (mesh_t **)xm_alloc(sizeof(mesh_t*));
         pieces[0] = h;
         npieces = 1;
     }
@@ -63,6 +63,6 @@ void phys_free(phys_t *p) {
     int i;
     if (!p) return;
     for (i = 0; i < p->npieces; i++) mesh_free(p->pieces[i]);
-    free(p->pieces);
+    xm_free(p->pieces);   /* may be libc- or xm-allocated: xm_free handles both */
     p->pieces = NULL; p->npieces = 0;
 }

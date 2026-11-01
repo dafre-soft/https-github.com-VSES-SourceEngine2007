@@ -64,12 +64,12 @@ int buf_putvec(buf_t *b, vec3d_t v) {
 
 /* ------------------------------------------------------------- strtab */
 void str_init(strtab_t *st, long cap) {
-    buf_init(&st->b);
+    memset(st, 0, sizeof(*st));          /* strings live in g_stage below;
+                                            st->b stays empty and buf_free
+                                            on it is a harmless no-op. */
     if (cap < 1024) cap = 1024;
     st->cap = cap;
     st->used = 0;
-    /* reserve the string area at the tail of b.data lazily: we keep a
-     * separate staging buffer instead. */
     st->strings_start = 0;
 }
 

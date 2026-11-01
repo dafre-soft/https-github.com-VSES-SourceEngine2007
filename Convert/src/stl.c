@@ -11,7 +11,10 @@ mesh_t *mesh_new(void) {
 
 void mesh_free(mesh_t *m) {
     if (!m) return;
-    free(m->v); free(m->n); free(m->tri); free(m);
+    /* stl.c allocates with libc realloc; simplify.c may have grown the same
+     * buffers through xm_realloc (budgeted allocator).  xm_free detects the
+     * block owner via its guard magic, so it is safe for both cases. */
+    xm_free(m->v); xm_free(m->n); xm_free(m->tri); xm_free(m);
 }
 
 static void *xrealloc(void *p, size_t n) {
