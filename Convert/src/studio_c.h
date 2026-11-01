@@ -1,0 +1,648 @@
+/* studio_c.h - Plain-C mirror of Valve's Source (2007) SDK structures from
+ * src_main/public/studio.h.  Field names, types and layout are kept identical
+ * to the original C++ headers so that this self-contained compiler produces
+ * byte-compatible MDL/VVD files for the Episode Two / Orange Box era engine
+ * (studiohdr version 48, vvd version 4).
+ */
+#ifndef STUDIO_C_H
+#define STUDIO_C_H
+
+#include <stdint.h>
+
+typedef int32_t  intu;      /* "int" in the original headers               */
+typedef uint32_t uintu;
+typedef float    fltim;
+
+#ifndef VECTOR_H
+typedef struct { fltim x, y, z; } vec3d_t;
+#endif
+typedef struct { fltim x, y, z, w; } vec4d_t;
+
+/* Four-component packed vertex blendweight (byte4 in the SDK) */
+typedef struct { unsigned char b0, b1, b2, b3; } blendweight_c_t;
+
+#define MDL_MAX_NAME     32
+#define MDL_MAX_PATH     64
+#define MDL_MAX_BONES    128
+#define MDL_MAX_BLEND    8
+#define MDL_MAX_SEQCTRL  2
+#define MDC_HITBOXMAX    8
+#define MDC_HULLGROUPMAX 4
+#define BONE_MASS        1.0f
+
+/* ------------------------------------------------------------------ flags */
+/* studiohdr_t surfaceFlags / flags */
+#define STUDIOHDR_FLAGS_MONOLITHIC_LBONE   0x00000001
+#define STUDIOHDR_FLAGS_HITBOX_SET         0x00000002
+#define STUDIOHDR_FLAGS_ONLY_SHADOW        0x00000004
+#define STUDIOHDR_FLAGS_NO_FORCED_FADE     0x00000010
+#define STUDIOHDR_FLAGS_FORCE_OPACITY      0x00000020
+#define STUDIOHDR_FLAGS_HITBOX_COLLIDE     0x00000040
+#define TRANSLUCENT                        0x00000001
+#define MODELTRANSPARENCY_NONE             0
+#define MODELTRANSPARENCY_ALPHA            1
+
+/* mstudiobone_t flags */
+#define BONE_NEVERLAST                     0x00000001
+#define BONE_ALWAYSLAST                    0x00000002
+#define BONE_USED_BY_HITBOX                0x00000100
+#define BONE_USED_BY_ATTACHMENT            0x00000200
+#define BONE_USED_BY_MASKBONES             0x00000400
+#define BONE_USED_BY_BC                    0x00000800
+#define BONE_USED_BY_KINECT                0x00001000
+#define BONE_PROCEDURAL                    0x00002000
+#define BONE_USED_BY_PHYSICS               0x00008000
+#define BONE_BOX                           0x00010000
+#define BONE_ANIMATION                     0x00020000
+#define BONE_CONFIG                        0x00040000
+#define BONE_JIGGLE                        0x00080000
+#define BONE_FLEX                          0x00100000
+#define BONE_SURFACE                       0x00200000
+#define BONE_WORKFLOW_CONTROL              0x00400000
+#define BONE_RENDER_TO_TEXTURE             0x00800000
+#define BONE_ADDITIONAL_WORLDSPACE_PARENT  0x01000000
+#define BONE_USED_BY_VEHICLE_CLIMBABLE_WALLS 0x02000000
+#define BONE_USED_BY_CHANGE_EYEPODS        0x04000000
+#define BONE_USED_BY_CREATION_ENGINE_AUDIO 0x08000000
+
+/* mesh flags */
+#define MESH_FLAG_DRAWABLE                 0x01
+#define MESH_FLAG_CASTS_SHADOW             0x02
+
+/* model flags */
+#define MODELFLAG_AUTOSCALE_TEXTURES       0x01
+#define MODELFLAGS_SPLITBONECONTAINER      0x02
+
+/* sequence flags */
+#define SEQ_FLAG_LOOPING                   0x00000001
+#define SEQ_FLAG_HITBOXSET                 0x00000002
+#define SEQ_FLAG_TRANSMIT                   0x00000004
+#define SEQ_FLAG_UNKNOWN_INTERPOLATION     0x00000008
+#define SEQ_FLAG_AUTO_MERGE_LOOPS          0x00000010
+#define SEQ_FLAG_NOACTIVITYEVENTS          0x00000020
+#define SEQ_FLAG_ALTERNATE_SEQUENCE        0x00000040
+#define SEQ_FLAG_PRIMARY_SEQUENCE          0x00000080
+
+/* physics collision flags */
+#define SOLID_BBOX                         1
+#define SOLID_CUSTOM                       5
+#define COLLISION_ONLY_DYNAMIC             0x00000001
+#define COLLISION_ONLY_STATIC              0x00000002
+#define CONTENTS_SOLID                     0x00000001
+#define MASK_PLAYERSOLID                   0x00000001
+
+/* ---------------------------------------------------------------- header */
+#pragma pack(push, 4)
+
+typedef struct {
+    char        id[4];            /* "IDST"                                    */
+    intu        version;          /* 48                                        */
+    intu        checksum;
+    char        name[MDL_MAX_NAME];
+    intu        length;
+    intu        eyeposition;      /* vec3d offset                             */
+    intu        llpix;            /* lighting lookup                            */
+    intu        hlpikm;           /* hull information                           */
+    intu        vmv;              /* view model vertex cache transform elem    */
+    intu        mmv;              /* mutation morph vert cache                  */
+    intu        maxscale;
+    intu        flags;
+    intu        usedcount;
+    intu        bbonecount;       /* number of bones                            */
+    intu        bboneoffset;
+    intu        cbonecount;       /* count of runtime needed bones              */
+    intu        cboneoffset;
+    intu        bcontrollercount;
+    intu        bcontrolleroffset;
+    intu        ccontrollercount;
+    intu        ccontrolleroffset;
+    intu        bmotioncount;
+    intu        bmotionoffset;
+    intu        btexturecount;
+    intu        btextureoffset;
+    intu        ctexturecount;
+    intu        ctextureoffset;
+    intu        tskinrefcount;
+    intu        tskinoffset;
+    intu        tlocalordercount;
+    intu        tlocalorderoffset;
+    intu        hostablecount;
+    intu        hostableoffset;
+    intu        ckitcount;
+    intu        ckitoffset;
+    intu        ctexturedatacount;
+    intu        ctexturedataoffset;
+    intu        texfixedparamscount;
+    intu        texfixedparamsoffset;
+    intu        keydatacount;
+    intu        keydataoffset;
+    intu        cinfluencecount;
+    intu        cinfluenceoffset;
+    intu        boneMergeBonesCount;
+    intu        boneMergeBonesOffset;
+    intu        _dummy;
+    intu        boneMergeStartBoneIndex;
+    intu        camPathCount;
+    intu        camPathOffset;
+    intu        boneRotationCount;
+    intu        boneRotationOffset;
+} studiohdr_c_t;
+
+typedef struct {
+    intu        sznameindex;
+    intu        parent;
+    intu        bonecontrollerparent;
+    intu        physicsbone;
+    fltim       poseToBone[3][4];
+    vec3d_t     qAlignment;
+    intu        rotaxis;
+    vec3d_t     pos;
+    vec3d_t     quat;             /* stored as x,y,z,w (quat_t is a union)     */
+    vec3d_t     rotation;
+    vec3d_t     translation;
+    intu        boneflags;
+    intu        bonecontrollers;
+    intu        localToTranslational;
+    intu        localToRotational;
+} mstudiobone_c_t;
+
+typedef struct {
+    intu        bone;
+    intu        base;
+    fltim       smooth;
+    intu        _unused;
+} mstudiobonecontroller_c_t;
+
+typedef struct {
+    intu        lookupType;
+    intu        lookupName;
+    intu        params[MDL_MAX_SEQCTRL];
+    intu        count[MDL_MAX_SEQCTRL];
+    intu        pad[4];
+} mstudiomovement_c_t;
+
+typedef struct {
+    intu        type;
+    intu        name;
+    intu        texture;
+} mstudiotexture_c_t;
+
+typedef struct {
+    intu        texture;
+    intu        flags;
+    intu        u;
+    intu        v;
+} mstudyuvanim_t;
+
+typedef struct {
+    intu        material;
+    intu        flags;
+} mstudiomaterialmod_t;
+
+typedef struct {
+    intu        bodypart;
+    fltim       deformscale;
+    intu        model;
+    intu        pad;
+} mstudio_model_t;
+
+typedef struct {
+    intu        nummodels;
+    intu        base;
+    intu        testbase;
+    intu        testgroup;
+    char        name[MDL_MAX_NAME];
+    intu        pad;
+} mstudiobodyparts_c_t;
+
+typedef struct {
+    intu        numbones;
+    intu        boneoffset;
+    intu        numbonecontrollers;
+    intu        bonecontrolloffset;
+    intu        hitboxset;
+    intu        hitboxoffset;
+    intu        hitboxcount;
+    intu        localoffset;
+    intu        namingoffset;
+    intu        keyvalueindex;
+    intu        source;
+    intu        ids;
+    intu        pad[4];
+} mstudioboneproxy_c_t;
+
+typedef struct {
+    intu        bone;
+    intu        group;
+    vec3d_t     origin;
+    vec3d_t     normal;
+    vec3d_t     vert;
+    fltim       dist;
+    intu        flags;
+    intu        _pad;
+} mstudiocollisionmeshvert_t;
+
+typedef struct {
+    vec3d_t     center;
+    fltim       radius;
+    intu        vertical;
+    intu        _pad;
+} mstudiocollisionmeshcapsulevert_t;
+
+typedef struct {
+    intu        index;
+    intu        _pad[3];
+} mstudiocollisionedgetrim_t;
+
+typedef struct {
+    char        name[MDL_MAX_NAME];
+    intu        parent;
+    fltim       pos[3];
+    fltim       quat[4];
+    intu        radius;
+    intu        length;
+    intu        how;
+    intu        fixed;
+    intu        mass;             /* fltim                                     */
+    intu        pads;
+    intu        _pad[2];
+} mstudioradialedge_t;
+
+typedef struct {
+    char        name[MDL_MAX_NAME];
+    intu        parent;
+    fltim       pos[3];
+    fltim       quat[4];
+    intu        radius;
+    intu        length;
+    intu        how;
+    intu        fixed;
+    intu        mass;
+    intu        pads;
+    intu        _pad[2];
+} mstudioradialedge2_t;
+
+typedef struct {
+    char        name[MDL_MAX_NAME];
+    intu        parent;
+    fltim       pos[3];
+    fltim       quat[4];
+    intu        radius;
+    intu        length;
+    intu        how;
+    intu        fixed;
+    intu        mass;
+    intu        pads;
+    intu        _pad[2];
+} mstudiojointballsocket_t;
+
+typedef struct {
+    char        name[MDL_MAX_NAME];
+    intu        parent;
+    fltim       pos[3];
+    fltim       quat[4];
+    intu        radius;
+    intu        length;
+    intu        how;
+    intu        fixed;
+    intu        mass;
+    intu        pads;
+    intu        _pad[2];
+} mstudiojointaxis_t;
+
+typedef struct {
+    char        name[MDL_MAX_NAME];
+    intu        parent;
+    fltim       pos[3];
+    fltim       quat[4];
+    intu        radius;
+    intu        length;
+    intu        how;
+    intu        fixed;
+    intu        mass;
+    intu        pads;
+    intu        _pad[2];
+} mstudiojoinslider_t;
+
+typedef struct {
+    char        name[MDL_MAX_NAME];
+    intu        parent;
+    fltim       pos[3];
+    fltim       quat[4];
+    intu        radius;
+    intu        length;
+    intu        how;
+    intu        fixed;
+    intu        mass;
+    intu        pads;
+    intu        _pad[2];
+} mstudiojointuniversal_t;
+
+/* ------------------------------------------------------------- mesh data */
+typedef struct {
+    intu        vertexoffset;
+    intu        vertexcount;
+    intu        triangleoffset;
+    intu        trianglecount;
+    intu        phoneshadeoffset;
+    intu        phoneshadecount;
+    fltim       modelradius;
+    intu        material;
+    intu        flags;
+    intu        skinref;
+    intu        numnormals;
+    intu        numtangents;
+    intu        numverts;
+    intu        verts;
+    intu        vertbasesize;
+    intu        vertexsize;
+    intu        _pad[2];
+} mstudiomesh_c_t;
+
+typedef struct {
+    intu        lod;
+    intu        city;
+    intu        _pad[2];
+} mstudiesimplemodelinfo_t;
+
+typedef struct {
+    vec3d_t     pos;
+    fltim       weight[4];
+    intu        bone[4];
+    intu        _pad;
+} mstudiovertex_t;
+
+typedef struct {
+    vec3d_t     pos;
+    vec3d_t     normal;
+    vec4d_t     tangent;
+    unsigned short s, t;
+    blendweight_c_t boneWeight;
+    unsigned char   boneIndex[4];
+    unsigned char   _pad[3];
+} virtualmeshvertex_t;
+
+typedef struct {
+    intu        vertexoffset;
+    intu        vertexcount;
+    intu        triangleoffset;
+    intu        trianglecount;
+    intu        material;
+    intu        flags;
+} virtualmeshlods_t;
+
+typedef struct {
+    intu        lodlevel;
+    intu        loderror;
+} virtualmeshtransition_t;
+
+typedef struct {
+    intu        vertexes;
+    intu        vertexsize;
+    intu        triangles;
+    intu        trianglecount;
+    intu        lod;
+    intu        lodcount;
+    intu        transition;
+    intu        transitioncount;
+    intu        mesh;
+    intu        meshcount;
+    intu        rootnormal;
+    intu        rootnormalcount;
+    intu        fixup;
+    intu        fixupcount;
+    char        name[MDL_MAX_NAME];
+    intu        source;
+    intu        _pad[3];
+} virtualmeshdesc_t;
+
+typedef struct {
+    char        id[4];            /* "VVD1"                                   */
+    intu        version;          /* 4                                         */
+    intu        checksum;
+    intu        filelen;
+    virtualmeshdesc_t meshdesc;
+} vvdheader_c_t;
+
+typedef struct {
+    intu        size;
+    intu        sizefixup;
+    char        name[MDL_MAX_NAME];
+    intu        hedat;
+    intu        heder;
+    intu        fdat;
+    intu        fer;
+    intu        _pad[4];
+} virtualmeshfixupheader_t;
+
+typedef struct {
+    intu        vertexid;
+    intu        triangleid;
+    unsigned short vertexfixup;
+    unsigned short trianglefixup;
+    vec3d_t     pos;
+    blendweight_c_t boneWeight;
+    unsigned char   boneIndex[4];
+    intu        _pad;
+} virtualmeshfixupvertex_t;
+
+/* ------------------------------------------------------------ collision */
+typedef struct {
+    intu        type;             /* 7 = convex                                */
+    intu        count;
+    intu        vertoffset;
+    intu        vertparent;
+    intu        edgetrimoffset;
+    intu        edgetrimcount;
+    intu        faceoffset;
+    intu        facecount;
+    intu        boxoffset;
+    intu        edgemargin;
+    intu        facemargin;
+    intu        spherecenter;
+    intu        sphereradius;
+    intu        surfacenameIndex;
+    intu        surfaceprop;
+    intu        surfaceflags;
+    intu        iCenterMass;
+    intu        iMass;
+    intu        iPad;
+    fltim       Slab[3];
+    fltim       CenterOfMass[3];
+    fltim       MomentsOfInertia[3];
+    fltim       ProductsOfInertia[3];
+    fltim       AABBMin[3];
+    fltim       AABBMax[3];
+    intu        _pad[8];
+} mstudiocollisionmodel_c_t;
+
+typedef struct {
+    intu        index;
+    intu        normal;
+    intu        vertindex;
+    intu        parent;
+    intu        next;
+    intu        _pad[3];
+} mstudiocollisionmodeltri_t;
+
+/* --------------------------------------------------------------- hitbox */
+typedef struct {
+    intu        bone;
+    intu        group;
+    vec3d_t     bbmin;
+    vec3d_t     bbmax;
+    intu        sznameindex;
+    intu        solid;
+    intu        _pad[2];
+} mstudiohitboxset_c_t;
+
+/* -------------------------------------------------------------- textures */
+typedef struct {
+    intu        width;
+    intu        height;
+    intu        depth;
+    intu        flags;
+    intu        numframes;
+    intu        bbox;
+    intu        unpackedsize;
+    intu        _pad;
+} mstudio纹理placeholder_t; /* renamed below to avoid non-ascii */
+
+typedef struct {
+    intu        width;
+    intu        height;
+    intu        depth;
+    intu        flags;
+    intu        numframes;
+    intu        bbox;             /* fltim                                     */
+    intu        unpackedsize;
+    intu        _pad;
+} mstudiotexture_c_t;
+
+typedef struct {
+    intu        imageoffset;
+    intu        imagesize;
+    intu        uncompressedsize;
+    intu        _pad;
+} mstudiotexturedata_c_t;
+
+typedef struct {
+    intu        flags;
+    intu        totalUnpackedSize;
+    intu        maxFrame;
+    intu        maxScale;
+    intu        pad[4];
+} mstudiopackedtex_flex_t; /* not used */
+
+typedef struct {
+    char        name[MDL_MAX_NAME];
+    intu        parent;
+    intu        flags;
+    intu        numchannels;
+    intu        channelarray;
+    intu        channels;
+    intu        pad;
+} mstudioanimrec_c_t;
+
+typedef struct {
+    intu        channelvalue;
+    intu        channelindex;
+    intu        next;
+    intu        _pad;
+} mstudioanimlist_t;
+
+typedef struct {
+    intu        channeltype;
+    intu        startframe;
+    intu        endframe;
+    intu        next;
+    intu        _pad;
+} mstudioanimvalue_desc_t;
+
+typedef struct {
+    intu        channelvalue;
+    intu        channelindex;
+    intu        next;
+    intu        _pad;
+} mstudioanimvaluelist_t;
+
+/* -------------------------------------------------------------- sequence */
+typedef struct {
+    char        label[32];
+    intu        duration;
+    intu        time;
+    intu        numlines;
+    intu        weight;
+    intu        numcontrols;
+    intu        controlptr;
+    intu        interactioncount;
+    intu        interactionoffset;
+    intu        motioncount;
+    intu        motionoffset;
+    intu        animblocktype;
+    intu        animblockindex;
+    intu        sectionunknown;
+    intu        movementcount;
+    intu        movementoffset;
+    fltim       previewreference;
+    intu        automovementindex;
+    intu        collisionindex;
+    intu        eventsindex;
+    intu        eventscount;
+    intu        framerate;
+    intu        entrynode;
+    intu        exitnode;
+    intu        nodelookahead;
+    intu        seqgroup;
+    char        inactsequence[32];
+    intu        activity;
+    fltim       actweight;
+    intu        numacttrans;
+    intu        acttransoffset;
+    intu        numiklocks;
+    intu        iklocksoffset;
+    intu        keyvalueindex;
+    intu        alpha;
+    intu        beta;
+    intu        interpout;
+    intu        interpin;
+    fltim       poseparamstart;
+    fltim       poseparamend;
+    fltim       cycle;
+    fltim       cycletoduration;
+    intu        flags;
+    intu        activitypauseweight;
+    intu        weightlist;
+    intu        numweights;
+    intu        pad[4];
+} mstudioseqdesc_c_t;
+
+typedef struct {
+    intu        controller;
+    intu        master;
+    fltim       lo;
+    fltim       hi;
+    fltim        loBlend;
+    fltim        hiBlend;
+    fltim       SplineMasterValue;
+} mstudioseqctrl_t;
+
+typedef struct {
+    intu        szNameIndex;
+    intu        hldam;
+    intu        ldam;
+    intu        ldamp;
+    intu        ldt;
+    intu        ldfreq;
+    intu        rdfdam;
+    intu        rdam;
+    intu        rdamp;
+    intu        rdt;
+    intu        rdfreq;
+    intu        rdir;
+    intu        _pad;
+} mstudiojigglebone_t;
+
+#pragma pack(pop)
+
+#endif /* STUDIO_C_H */
