@@ -33,6 +33,9 @@ static void usage(void) {
 "  -rot <ax><deg>     rotate mesh (x/y/z + degrees), repeatable\n"
 "  -swapyz            swap Y/Z axes (CAD Z-up -> Source Y-up)\n"
 "  -nomerge           disable vertex welding (keep faceted STL verts)\n"
+"  -mem <MB>          memory budget for the converter (default 512 MB;\n"
+"                     0 = unlimited). All scratch data is heap-allocated,\n"
+"                     so this never touches the (1 MB) Windows stack.\n"
 "  -q                 quiet\n"
 "  -h, --help         this help\n"
 "\n"
@@ -122,6 +125,12 @@ int main(int argc, char **argv) {
             rot_used = 1;
         }
         else if (!strcmp(a,"-nomerge")) o.nomerge = 1;
+        else if ((!strcmp(a,"-mem") || !strcmp(a,"--memory") || !strcmp(a,"-memory")) && ai+1<argc) {
+            double mb = atof(argv[++ai]);
+            if (mb < 0) mb = 0;
+            o.membytes = (size_t)(mb * 1024.0 * 1024.0);
+            xm_set_budget(o.membytes);
+        }
         else if (!strcmp(a,"-q")) o.verbose = 0;
         else if (a[0]=='-' && a[1]) { ERR("unknown option '%s'", a); usage(); return 1; }
         else {
@@ -211,6 +220,10 @@ int main(int argc, char **argv) {
     phys_build(colldec, &o, &phys);
     INFO("physics: %d convex piece(s), volume %.1f in^3, mass %.2f kg, COM (%.1f,%.1f,%.1f)",
          phys.npieces, phys.vol, phys.mass, phys.com.x, phys.com.y, phys.com.z);
+    if (o.verbose)
+        INFO("memory: peak %llu MB of %llu MB budget (-mem to change)",
+             (unsigned long long)(xm_used()/(1024*1024)),
+             (unsigned long long)(xm_budget()?(xm_budget()/(1024*1024)):0));
 
     if (write_mdl_vvd(o.out, vis, lods, o.nlods, &phys, &o) != 0) return 1;
 

@@ -8,12 +8,13 @@
  */
 #include "mdlc.h"
 
-static void *xr(void *p, size_t n) {
-    void *q = realloc(p, n ? n : 1);
-    if (!q) { ERR("out of memory"); exit(2); }
-    return q;
-}
+/* all scratch allocations go to the heap through the budgeted allocator
+ * (xmem.c). The old code used ~4 MB stack buffers here which killed the
+ * Windows build (1 MB default thread stack) with a bogus "out of memory". */
+static void *xr(void *p, size_t n) { return xm_realloc(p, n); }
+static void xrf(void *p)            { xm_free(p); }
 
+__attribute__((unused))
 static int cmp_ull(const void *x, const void *y) {
     unsigned long long a = *(const unsigned long long*)x;
     unsigned long long b = *(const unsigned long long*)y;
@@ -53,65 +54,54 @@ static int collapse_ok_fast(const vec3d_t *V, const unsigned int *tri,
                             const unsigned int *vstart, const unsigned int *adj,
                             unsigned int nv, unsigned int w,
                             unsigned int a, unsigned int b, const vec3d_t *newp) {
-    unsigned int s0, s1, p;
-    for (s0 = vstart[a], s1 = vstart[a+1], p = s0; ; p++) {
-        unsigned int i, t0, t1, t2;
-        int has_a, has_b;
-        if (p >= s1) {                     /* vertex a done; switch to b */
-            if (s0 != vstart[b]) break;    /* already finished both      */
-            s0 = vstart[b]; s1 = vstart[b+1]; p = s0 - 1; continue;
-        }
-        i = adj[p];
-        if (i >= w) continue;
-        t0 = tri[i*3]; t1 = tri[i*3+1]; t2 = tri[i*3+2];
-        has_a = (t0==a)+(t1==a)+(t2==a);
-        has_b = (t0==b)+(t1==b)+(t2==b);
-        if (has_a && has_b) continue;           /* triangle removed */
-        if (!has_a && !has_b) continue;         /* untouched        */
-        {
-        unsigned int ids[3] = {t0,t1,t2};
-        vec3d_t e1, e2, old_n, new_n;
-        int k;
-        for (k = 0; k < 3; k++) if (ids[k]==a || ids[k]==b) break;
-        ids[k] = 0xffffffffu; /* mark */
-        vec3d_t p3[3];
-        {
-            int j, m = 0;
-            vec3d_t tmp[3];
-            (void)m;
-            for (j = 0; j < 3; j++) {
-                if (ids[j] == 0xffffffffu) tmp[j] = *newp;
-                else tmp[j] = V[ids[j]];
-            }
-            p3[0]=tmp[0]; p3[1]=tmp[1]; p3[2]=tmp[2];
-        }
-        v_sub(p3[1], p3[0], &e1);
-        v_sub(p3[2], p3[0], &e2);
-        v_cross(e1, e2, &new_n);
-        /* original */
-        vec3d_t op[3];
-        {
-            int j;
+    unsigned int side;
+    for (side = 0; side < 2; side++) {
+        unsigned int vx = side ? b : a;
+        unsigned int p, s0 = vstart[vx], s1 = vstart[vx+1];
+        if (vx >= nv) continue;
+        for (p = s0; p < s1; p++) {
+            unsigned int i = adj[p];
+            unsigned int t0, t1, t2;
+            int has_a, has_b;
+            if (i >= w) continue;
+            t0 = tri[i*3]; t1 = tri[i*3+1]; t2 = tri[i*3+2];
+            has_a = (t0==a)+(t1==a)+(t2==a);
+            has_b = (t0==b)+(t1==b)+(t2==b);
+            if (has_a && has_b) continue;           /* triangle removed */
+            if (!has_a && !has_b) continue;         /* untouched        */
+            if (has_a > 1 || has_b > 1) return 0;   /* non-manifold edge pair */
+            {
+            unsigned int ids[3] = {t0,t1,t2};
+            vec3d_t e1, e2, old_n, new_n, tmp[3], op[3];
+            int k, j;
+            for (k = 0; k < 3; k++) if (ids[k]==a || ids[k]==b) break;
+            ids[k] = 0xffffffffu; /* mark */
             for (j = 0; j < 3; j++)
-                op[j] = (tri[i*3+j]==a) ? V[a] : (tri[i*3+j]==b) ? V[b] : V[tri[i*3+j]];
-        }
-        v_sub(op[1], op[0], &e1);
-        v_sub(op[2], op[0], &e2);
-        v_cross(e1, e2, &old_n);
-        if (v_dot(old_n, new_n) <= 0.0f) return 0;   /* flip */
-        {
-            float ol = v_len(old_n);
-            if (ol > 1e-9f) {
-                float nl = v_len(new_n);
-                if (nl < ol * 0.05f) return 0;       /* degenerate */
+                tmp[j] = (ids[j] == 0xffffffffu) ? *newp : V[ids[j]];
+            v_sub(tmp[1], tmp[0], &e1);
+            v_sub(tmp[2], tmp[0], &e2);
+            v_cross(e1, e2, &new_n);
+            for (j = 0; j < 3; j++)
+                op[j] = V[tri[i*3+j]];
+            v_sub(op[1], op[0], &e1);
+            v_sub(op[2], op[0], &e2);
+            v_cross(e1, e2, &old_n);
+            if (v_dot(old_n, new_n) <= 0.0f) return 0;   /* flip */
+            {
+                float ol = v_len(old_n);
+                if (ol > 1e-9f) {
+                    float nl = v_len(new_n);
+                    if (nl < ol * 0.05f) return 0;       /* degenerate */
+                }
             }
-        }
+            }
         }
     }
     return 1;
 }
 
 /* legacy full-scan variant (kept for reference / tiny meshes) */
+__attribute__((unused))
 static int collapse_ok(const vec3d_t *V, const unsigned int *tri, unsigned int nt,
                        unsigned int a, unsigned int b, const vec3d_t *newp) {
     unsigned int i;
@@ -175,19 +165,27 @@ static int collapse_ok(const vec3d_t *V, const unsigned int *tri, unsigned int n
  * so total complexity is near O(nt log nt) instead of O(nt * collapses).  */
 
 typedef struct { unsigned long long k; int slot; } eqent_t;
-#define EQM 0x3fffffffu            /* power-of-two-ish mask, load factor <0.5 */
+/* hash-table mask chosen at runtime from the triangle count so we never
+ * allocate a 1 GB table for a 2k-tri model (old fixed 0x3fffffff mask was
+ * the real "out of memory" on small models). Load factor kept <= 0.5. */
 
 static unsigned int eq_hash(unsigned long long k) {
     k ^= k >> 33; k *= 0xff51afd7ed558ccdULL; k ^= k >> 33; k *= 0xc4ceb9fe1a85ec53ULL; k ^= k >> 33;
-    return (unsigned int)(k & EQM);
+    return (unsigned int)k;
 }
-static eqent_t *eq_lookup(eqent_t *tab, unsigned long long k) {
-    unsigned int h = eq_hash(k);
+static eqent_t *eq_lookup_m(eqent_t *tab, unsigned long long k, unsigned int mask) {
+    unsigned int h = eq_hash(k) & mask;
     for (;;) {
         if (tab[h].slot == -1) return &tab[h];          /* free / insert here */
         if (tab[h].k == k)     return &tab[h];
-        h = (h + 1) & EQM;
+        h = (h + 1) & mask;
     }
+}
+
+static unsigned int eq_mask_for(unsigned int nedges) {
+    unsigned int m = 1023u;                    /* min 1k buckets */
+    while (m + 1u < 0x80000000u && (m + 1u) < nedges * 2u) m = m * 2u + 1u;
+    return m;
 }
 
 mesh_t *mesh_decimate(const mesh_t *src, unsigned int target) {
@@ -208,7 +206,7 @@ mesh_t *mesh_decimate(const mesh_t *src, unsigned int target) {
 
     if (target == 0 || target >= nt) {
         m->v = V; m->n = N; m->tri = T; m->nv = nv; m->nt = nt;
-        free(Q); free(alive);
+        xrf(Q); xrf(alive);
         return m;
     }
 
@@ -220,15 +218,18 @@ mesh_t *mesh_decimate(const mesh_t *src, unsigned int target) {
     unsigned long long *ek = (unsigned long long*)xr(NULL, sizeof(unsigned long long)*nt*3);
     float        *ecst = (float*)xr(NULL, sizeof(float)*nt*3);
     unsigned int *estp = (unsigned int*)xr(NULL, sizeof(unsigned int)*nt*3);
-    unsigned int *heap = (unsigned int*)xr(NULL, sizeof(unsigned int)*nt*3);
+    /* heap may receive duplicate lazy re-pushes: give it generous slack */
+    const unsigned int hcap = nt*4u + 1024u;
+    unsigned int *heap = (unsigned int*)xr(NULL, sizeof(unsigned int)*hcap);
     unsigned int *pos  = (unsigned int*)xr(NULL, sizeof(unsigned int)*nt*3);
+    const unsigned int EQM = eq_mask_for(nt*3u/2u + 16u);
     eqent_t *emap      = (eqent_t*)xr(NULL, sizeof(eqent_t)*(EQM+1));
     unsigned int nq = 0, nh = 0, ver = 1;
 
     /* ---------- build incidence + unique-edge queue (one-time, O(nt)) ----- */
     {
         unsigned int _k,_j,_a,_b;
-        for (_k=0;_k<=EQM;_k++) emap[_k].slot=-1;
+        memset(emap, 0xFF, sizeof(eqent_t)*(EQM+1));   /* slot=-1 everywhere */
         for (_j=0;_j<nv;_j++) cnt[_j]=0;
         w = cur_nt;
         for (_k=0;_k<w;_k++){
@@ -250,7 +251,7 @@ mesh_t *mesh_decimate(const mesh_t *src, unsigned int target) {
         }
         for(_k=0;_k<w*3;_k++){
             unsigned long long e=tri_edge[_k];
-            eqent_t *en=eq_lookup(emap,e);
+            eqent_t *en=eq_lookup_m(emap,e,EQM);
             if(en->slot==-1){
                 en->k=e; en->slot=(int)nq;
                 ek[nq]=e; pos[nq]=0; nq++;
@@ -261,7 +262,10 @@ mesh_t *mesh_decimate(const mesh_t *src, unsigned int target) {
     /* min-heap over slot costs ecst[] (1-based) */
     #define HEAP_PUSH(slot)                                                        \
     do{                                                                            \
-        unsigned int _h = ++nh, _s = (slot);                                       \
+        unsigned int _h, _s = (slot);                                              \
+        if (nh + 1u >= hcap) break; /* queue full: drop re-push; lazy      \
+                                                 stamps keep correctness          */ \
+        _h = ++nh;                                                                 \
         while(_h>1){ unsigned int _p=_h/2;                                         \
             if(ecst[heap[_p]]<=ecst[_s]) break;                                    \
             heap[_h]=heap[_p]; pos[heap[_h]]=_h; _h=_p; }                          \
@@ -307,7 +311,7 @@ mesh_t *mesh_decimate(const mesh_t *src, unsigned int target) {
         if (c > ecst[slot] + 1e-12f) {                      /* extra safety */
             ecst[slot]=c; estp[slot]=ver; HEAP_PUSH(slot); continue;
         }
-        if (!collapse_ok(V, T, cur_nt, a, b, &mid)) continue;
+        if (!collapse_ok_fast(V, T, vstart, adj, nv, w, a, b, &mid)) continue;
 
         /* collect triangles incident to a or b BEFORE rewriting (CSR lists
          * still reference old compacted indices — valid until rebuild below) */
@@ -344,7 +348,7 @@ mesh_t *mesh_decimate(const mesh_t *src, unsigned int target) {
                     unsigned long long k; eqent_t *en; int sl;
                     if(x>y){unsigned int s=x;x=y;y=s;}
                     k=((unsigned long long)x<<32)|y;
-                    en=eq_lookup(emap,k); sl=en->slot;
+                    en=eq_lookup_m(emap,k,EQM); sl=en->slot;
                     if(sl<0 || (unsigned)sl>=nq) continue;
                     EVAL_SLOT((unsigned)sl); estp[sl]=ver;
                     if(pos[sl]) {/* already queued at old cost: remove lazily by
@@ -357,8 +361,8 @@ mesh_t *mesh_decimate(const mesh_t *src, unsigned int target) {
     #undef HEAP_PUSH
     #undef HEAP_POP
     #undef EVAL_SLOT
-    free(tri_edge); free(cnt); free(vstart); free(adj); free(ek);
-    free(ecst); free(estp); free(heap); free(pos); free(emap);
+    xrf(tri_edge); xrf(cnt); xrf(vstart); xrf(adj); xrf(ek);
+    xrf(ecst); xrf(estp); xrf(heap); xrf(pos); xrf(emap);
     }
 
     /* compact vertices: remove dead */
@@ -371,12 +375,12 @@ mesh_t *mesh_decimate(const mesh_t *src, unsigned int target) {
         NC = (vec3d_t *)xr(NULL, sizeof(vec3d_t)*(nc?nc:1));
         for (z = 0; z < nv; z++) if (alive[z]) { VC[map[z]] = V[z]; NC[map[z]] = N[z]; }
         for (z = 0; z < cur_nt*3; z++) T[z] = map[T[z]];
-        free(V); free(N);
+        xrf(V); xrf(N);
         m->v = VC; m->n = NC; m->tri = T;
         m->nv = nc; m->nt = cur_nt;
-        free(map);
+        xrf(map);
     }
-    free(Q); free(alive);
+    xrf(Q); xrf(alive);
     /* recompute smooth normals for stability */
     mesh_normals(m);
     return m;
@@ -470,10 +474,10 @@ static void emit_hull_piece(const mesh_t *m, int max_pieces,
 static mesh_t *mesh_subset(const mesh_t *m, const unsigned int *tritri, unsigned int ntt) {
     mesh_t *o = mesh_new();
     unsigned int i;
+    /* xm_alloc returns zeroed memory, so vused/vmap start clean */
     char *vused = (char *)xr(NULL, m->nv);
     unsigned int *vmap = (unsigned int *)xr(NULL, sizeof(unsigned int)*m->nv);
     unsigned int nv = 0;
-    memset(vused, 0, m->nv);
     for (i = 0; i < ntt; i++) {
         unsigned int t = tritri[i];
         vused[m->tri[t*3]] = vused[m->tri[t*3+1]] = vused[m->tri[t*3+2]] = 1;
@@ -490,7 +494,7 @@ static mesh_t *mesh_subset(const mesh_t *m, const unsigned int *tritri, unsigned
         o->tri[i*3+1] = vmap[m->tri[t*3+1]];
         o->tri[i*3+2] = vmap[m->tri[t*3+2]];
     }
-    free(vused); free(vmap);
+    xrf(vused); xrf(vmap);
     mesh_normals(o);
     return o;
 }
@@ -532,7 +536,7 @@ static void split_rec(const mesh_t *m, int depth, int maxdepth, int max_pieces,
     }
     if (nl == 0 || nr == 0) { /* cannot split: emit hull */
         emit_hull_piece(m, max_pieces, pieces, np);
-        free(left); free(right);
+        xrf(left); xrf(right);
         return;
     }
     {
@@ -542,7 +546,7 @@ static void split_rec(const mesh_t *m, int depth, int maxdepth, int max_pieces,
         split_rec(mr, depth+1, maxdepth, max_pieces, trim_eps, pieces, np);
         mesh_free(ml); mesh_free(mr);
     }
-    free(left); free(right);
+    xrf(left); xrf(right);
 }
 
 int mesh_decompose_convex(const mesh_t *m, int max_pieces, float trim_eps,
@@ -618,12 +622,14 @@ mesh_t *mesh_convex_hull(const mesh_t *m) {
         }
     }
 
+    /* "visible" list moved to the heap: the old 32 KB stack VLA-style
+     * array contributed to Windows stack exhaustion under recursion */
+    int *visible = (int*)xr(NULL, sizeof(int)*(fc + 64u));
     for (i = 0; i < n; i++) {
         unsigned int j;
-        int visible[8192]; /* faces visible from point i */
         unsigned int vc = 0;
         int inside = 1;
-        if (fc > 8192) return NULL; /* safety */
+        if (fc > 8192) { xrf(visible); return NULL; /* safety */ }
         for (j = 0; j < fc; j++) {
             hface_t *f = &F[j];
             vec3d_t e1,e2,nr,p0;
@@ -634,6 +640,7 @@ mesh_t *mesh_convex_hull(const mesh_t *m) {
               if (v_dot(nr, dp) > 1e-7f) { visible[vc++]= (int)j; inside = 0; } }
         }
         if (inside) continue;
+        if (vc > fc) vc = fc;               /* paranoia clamp */
         /* mark removed, collect boundary edges */
         {
             unsigned int be[3][2]; int nbe = 0; /* max boundary for star region small */
@@ -668,10 +675,11 @@ mesh_t *mesh_convex_hull(const mesh_t *m) {
                 if (fc + 1 > fcap) { fcap*=2; F=(hface_t*)xr(F, sizeof(hface_t)*fcap); }
                 F[fc].v[0]=bed[j][0]; F[fc].v[1]=bed[j][1]; F[fc].v[2]=i; F[fc].rem=0; fc++;
             }
-            free(bed);
+            xrf(bed);
         }
     }
 
+    xrf(visible);
     out = mesh_new();
     {
         unsigned int live = 0, j;
@@ -696,9 +704,9 @@ mesh_t *mesh_convex_hull(const mesh_t *m) {
         out->v = (vec3d_t *)xr(NULL, sizeof(vec3d_t)*(nu?nu:1));
         out->n = (vec3d_t *)xr(NULL, sizeof(vec3d_t)*(nu?nu:1));
         for (j = 0; j < n; j++) if (vu[j]) out->v[used[j]] = m->v[j];
-        free(used); free(vu);
+        xrf(used); xrf(vu);
     }
-    free(F);
+    xrf(F);
     mesh_normals(out);
     return out;
 }

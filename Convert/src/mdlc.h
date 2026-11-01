@@ -73,7 +73,21 @@ typedef struct {
     int     nomerge;         /* disable vertex welding                  */
     int     verbose;
     int     forcephys;       /* always downgrade physics even w/o flag  */
+    size_t  membytes;        /* memory budget for the allocator pool    */
 } opts_t;
+
+/* ------------------------------------------------------------- xmemory */
+/* All big allocations go through xm*() helpers: a single realloc-based
+ * arena with a configurable budget (-mem <MB>, default 512 MB).  When the
+ * budget would be exceeded we free() and retry once (defragment), then
+ * fail with a clear message instead of an opaque crash. */
+void  *xm_alloc(size_t n);           /* calloc-like, zeroed            */
+void  *xm_realloc(void *p, size_t n);/* realloc that never returns NULL silently */
+void   xm_free(void *p);
+size_t xm_used(void);
+size_t xm_budget(void);
+void   xm_set_budget(size_t bytes);  /* 0 = unlimited                  */
+const char *xm_oom_msg(void);        /* human-readable OOM hint        */
 
 /* ----------------------------------------------------------- strtab/buf */
 typedef struct {
@@ -145,5 +159,6 @@ int  write_mdl_vvd(const char *basepath, const mesh_t *vis, mesh_t *lods[],
 #define MSG(o, ...) do { if ((o)->verbose) { printf("[stl2mdl] "); printf(__VA_ARGS__); printf("\n"); } } while (0)
 #define INFO(...)  do { printf("[stl2mdl] "); printf(__VA_ARGS__); printf("\n"); } while (0)
 #define ERR(...)   do { fprintf(stderr, "[stl2mdl:error] "); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } while (0)
+#define WARN(...)  do { printf("[stl2mdl:warn] "); printf(__VA_ARGS__); printf("\n"); } while (0)
 
 #endif /* MDLC_H */
