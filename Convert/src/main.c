@@ -138,6 +138,10 @@ int main(int argc, char **argv) {
         last = (slash > bs) ? slash : bs;
         if (last) memmove(outbase,last+1,strlen(last)+1);
         snprintf(o.out,sizeof(o.out),"%s",outbase);
+    } else {
+        /* strip a user-supplied .mdl extension so we never write "foo.mdl.mdl" */
+        char *d = o.out + strlen(o.out);
+        if (d - o.out >= 4 && !strcmp(d-4, ".mdl")) d[0] = 0;
     }
 
     INFO("reading %s ...", infile);

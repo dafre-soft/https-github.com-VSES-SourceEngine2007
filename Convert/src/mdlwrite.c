@@ -17,6 +17,8 @@ static unsigned int crc32_buf(const unsigned char *data, long len) {
     return c ^ 0xFFFFFFFFu;
 }
 static int put_str(mdlio_t *w, const char *s) { return str_add(&w->st, s); }
+/* defined in buf.c — staged string-table arena bytes (NUL-separated) */
+void *str_table_data(long *len);
 static void patch32(buf_t *b, long off, int val) { memcpy(b->data+off,&val,4); }
 static void patchf(buf_t *b, long off, float val) { memcpy(b->data+off,&val,4); }
 
@@ -377,7 +379,7 @@ int write_mdl_vvd(const char *basepath, const mesh_t *vis, mesh_t *lods[],
       patch32(&W.b,offsetof(studiohdr_c_t,bmotionoffset),(int)coll_off); }
 
     /* strings at EOF, then length/checksum */
-    { long slen; const unsigned char *sdat; studiohdr_c_t *h;
+    { long slen; const void *sdat; studiohdr_c_t *h;
       memcpy(W.b.data,IDSTUDIOHEADER,4);
       patch32(&W.b,offsetof(studiohdr_c_t,version),STUDIOHDR_VERSION);
       strncpy((char*)W.b.data+offsetof(studiohdr_c_t,name),o->out,MDL_MAX_NAME-1);

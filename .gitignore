@@ -1,2 +1,2 @@
-*.o
-*.out
+Convert/build/
+Convert/src/stl2mdl

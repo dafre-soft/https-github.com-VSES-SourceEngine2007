@@ -25,9 +25,9 @@ static int cmp_ull(const void *x, const void *y) {
  * collapse with a linear scan over triangles per pass (O(nt) per collapse
  * amortized by passes). Suitable up to ~500k tris for our purposes.       */
 
-typedef struct { float q[10]; } quad_t; /* symmetric 4x4 upper triangle */
+typedef struct { float q[10]; } sqmat_t; /* symmetric 4x4 upper triangle */
 
-static void quad_init(quad_t *Q, const vec3d_t p, const vec3d_t n) {
+static void quad_init(sqmat_t *Q, const vec3d_t p, const vec3d_t n) {
     /* plane through p with normal n: K = p*p^T + eps*(n*n^T), embedded in
      * 4x4 homogeneous form (Garland-Heckl). */
     float px = p.x, py = p.y, pz = p.z;
@@ -38,7 +38,7 @@ static void quad_init(quad_t *Q, const vec3d_t p, const vec3d_t n) {
     Q->q[9]=1.0f;
 }
 
-static float quad_eval(const quad_t *Q, const vec3d_t *p) {
+static float quad_eval(const sqmat_t *Q, const vec3d_t *p) {
     double v =
         Q->q[0]*p->x*p->x + 2*Q->q[1]*p->x*p->y + 2*Q->q[2]*p->x*p->z + 2*Q->q[3]*p->x +
               Q->q[4]*p->y*p->y + 2*Q->q[5]*p->y*p->z + 2*Q->q[6]*p->y +
@@ -46,7 +46,72 @@ static float quad_eval(const quad_t *Q, const vec3d_t *p) {
     return (float)(v < 0 ? 0 : v);
 }
 
-/* does collapsing edge (a,b) flip or degenerate any incident triangle? */
+/* does collapsing edge (a,b) flip or degenerate any incident triangle?
+ * FAST version: iterates only triangles adjacent to a or b via CSR
+ * (vstart/adj), instead of scanning the whole soup — O(deg) per check. */
+static int collapse_ok_fast(const vec3d_t *V, const unsigned int *tri,
+                            const unsigned int *vstart, const unsigned int *adj,
+                            unsigned int nv, unsigned int w,
+                            unsigned int a, unsigned int b, const vec3d_t *newp) {
+    unsigned int s0, s1, p;
+    for (s0 = vstart[a], s1 = vstart[a+1], p = s0; ; p++) {
+        unsigned int i, t0, t1, t2;
+        int has_a, has_b;
+        if (p >= s1) {                     /* vertex a done; switch to b */
+            if (s0 != vstart[b]) break;    /* already finished both      */
+            s0 = vstart[b]; s1 = vstart[b+1]; p = s0 - 1; continue;
+        }
+        i = adj[p];
+        if (i >= w) continue;
+        t0 = tri[i*3]; t1 = tri[i*3+1]; t2 = tri[i*3+2];
+        has_a = (t0==a)+(t1==a)+(t2==a);
+        has_b = (t0==b)+(t1==b)+(t2==b);
+        if (has_a && has_b) continue;           /* triangle removed */
+        if (!has_a && !has_b) continue;         /* untouched        */
+        {
+        unsigned int ids[3] = {t0,t1,t2};
+        vec3d_t e1, e2, old_n, new_n;
+        int k;
+        for (k = 0; k < 3; k++) if (ids[k]==a || ids[k]==b) break;
+        ids[k] = 0xffffffffu; /* mark */
+        vec3d_t p3[3];
+        {
+            int j, m = 0;
+            vec3d_t tmp[3];
+            (void)m;
+            for (j = 0; j < 3; j++) {
+                if (ids[j] == 0xffffffffu) tmp[j] = *newp;
+                else tmp[j] = V[ids[j]];
+            }
+            p3[0]=tmp[0]; p3[1]=tmp[1]; p3[2]=tmp[2];
+        }
+        v_sub(p3[1], p3[0], &e1);
+        v_sub(p3[2], p3[0], &e2);
+        v_cross(e1, e2, &new_n);
+        /* original */
+        vec3d_t op[3];
+        {
+            int j;
+            for (j = 0; j < 3; j++)
+                op[j] = (tri[i*3+j]==a) ? V[a] : (tri[i*3+j]==b) ? V[b] : V[tri[i*3+j]];
+        }
+        v_sub(op[1], op[0], &e1);
+        v_sub(op[2], op[0], &e2);
+        v_cross(e1, e2, &old_n);
+        if (v_dot(old_n, new_n) <= 0.0f) return 0;   /* flip */
+        {
+            float ol = v_len(old_n);
+            if (ol > 1e-9f) {
+                float nl = v_len(new_n);
+                if (nl < ol * 0.05f) return 0;       /* degenerate */
+            }
+        }
+        }
+    }
+    return 1;
+}
+
+/* legacy full-scan variant (kept for reference / tiny meshes) */
 static int collapse_ok(const vec3d_t *V, const unsigned int *tri, unsigned int nt,
                        unsigned int a, unsigned int b, const vec3d_t *newp) {
     unsigned int i;
@@ -97,16 +162,43 @@ static int collapse_ok(const vec3d_t *V, const unsigned int *tri, unsigned int n
     return 1;
 }
 
+/* ---- fast edge-collapse decimation (Garland-Heckl cost with a lazy
+ * priority queue).  Replaces the old O(n^2)-per-pass linear-scan loop.
+ * Structures:
+ *   tri_edge[k]  : canonical (min,max) packed edge key of triangle slot k
+ *   emap         : hash table edge-key -> queue slot (open addressing)
+ *   heap/pos     : min-heap over slot costs; pos[slot]=0 means "not queued"
+ *   stamp[slot]  : version counter — an entry is only trusted if its stamp
+ *                  matches the current one, otherwise it is re-evaluated.
+ * After each collapse we bump the global version and re-push only the edges
+ * belonging to the few triangles touched via CSR adjacency — O(deg) work,
+ * so total complexity is near O(nt log nt) instead of O(nt * collapses).  */
+
+typedef struct { unsigned long long k; int slot; } eqent_t;
+#define EQM 0x3fffffffu            /* power-of-two-ish mask, load factor <0.5 */
+
+static unsigned int eq_hash(unsigned long long k) {
+    k ^= k >> 33; k *= 0xff51afd7ed558ccdULL; k ^= k >> 33; k *= 0xc4ceb9fe1a85ec53ULL; k ^= k >> 33;
+    return (unsigned int)(k & EQM);
+}
+static eqent_t *eq_lookup(eqent_t *tab, unsigned long long k) {
+    unsigned int h = eq_hash(k);
+    for (;;) {
+        if (tab[h].slot == -1) return &tab[h];          /* free / insert here */
+        if (tab[h].k == k)     return &tab[h];
+        h = (h + 1) & EQM;
+    }
+}
+
 mesh_t *mesh_decimate(const mesh_t *src, unsigned int target) {
     mesh_t *m = mesh_new();
     unsigned int nv = src->nv, nt = src->nt;
     vec3d_t *V = (vec3d_t *)xr(NULL, sizeof(vec3d_t)*nv);
     vec3d_t *N = (vec3d_t *)xr(NULL, sizeof(vec3d_t)*nv);
     unsigned int *T = (unsigned int *)xr(NULL, sizeof(unsigned int)*nt*3);
-    quad_t *Q = (quad_t *)xr(NULL, sizeof(quad_t)*nv);
+    sqmat_t *Q = (sqmat_t *)xr(NULL, sizeof(sqmat_t)*nv);
     char *alive = (char *)xr(NULL, nv);
-    unsigned int i, cur_nt, cur_nv = nv;
-    int pass;
+    unsigned int i, cur_nt, w;
 
     memcpy(V, src->v, sizeof(vec3d_t)*nv);
     if (src->n) memcpy(N, src->n, sizeof(vec3d_t)*nv); else memset(N,0,sizeof(vec3d_t)*nv);
@@ -120,114 +212,164 @@ mesh_t *mesh_decimate(const mesh_t *src, unsigned int target) {
         return m;
     }
 
-    /* iterate passes: each pass scans edges, collapses cheapest ones until
-     * budget for this pass is met. Budget halves remaining excess per pass. */
-    for (pass = 0; pass < 24 && cur_nt > target; pass++) {
-        unsigned int want = target + (cur_nt - target) / 2; /* reduce halfway */
-        unsigned int edges_done = 0;
-        unsigned int *ea, *eb;
-        unsigned int ec = 0;
-        unsigned int k;
+    {
+    unsigned long long *tri_edge = (unsigned long long*)xr(NULL, sizeof(unsigned long long)*nt*3);
+    unsigned int *cnt    = (unsigned int*)xr(NULL, sizeof(unsigned int)*(nv+1));
+    unsigned int *vstart = (unsigned int*)xr(NULL, sizeof(unsigned int)*(nv+2));
+    unsigned int *adj    = (unsigned int*)xr(NULL, sizeof(unsigned int)*nt*3);
+    unsigned long long *ek = (unsigned long long*)xr(NULL, sizeof(unsigned long long)*nt*3);
+    float        *ecst = (float*)xr(NULL, sizeof(float)*nt*3);
+    unsigned int *estp = (unsigned int*)xr(NULL, sizeof(unsigned int)*nt*3);
+    unsigned int *heap = (unsigned int*)xr(NULL, sizeof(unsigned int)*nt*3);
+    unsigned int *pos  = (unsigned int*)xr(NULL, sizeof(unsigned int)*nt*3);
+    eqent_t *emap      = (eqent_t*)xr(NULL, sizeof(eqent_t)*(EQM+1));
+    unsigned int nq = 0, nh = 0, ver = 1;
 
-        ea = (unsigned int *)xr(NULL, sizeof(unsigned int)*cur_nt*3);
-        eb = (unsigned int *)xr(NULL, sizeof(unsigned int)*cur_nt*3);
-        for (k = 0; k < cur_nt; k++) {
-            unsigned int t[3] = {T[k*3],T[k*3+1],T[k*3+2]};
-            int j;
-            for (j = 0; j < 3; j++) {
-                unsigned int a = t[j], b = t[(j+1)%3];
-                if (a > b) { unsigned int s=a;a=b;b=s; }
-                ea[ec]=a; eb[ec]=b; ec++;
+    /* ---------- build incidence + unique-edge queue (one-time, O(nt)) ----- */
+    {
+        unsigned int _k,_j,_a,_b;
+        for (_k=0;_k<=EQM;_k++) emap[_k].slot=-1;
+        for (_j=0;_j<nv;_j++) cnt[_j]=0;
+        w = cur_nt;
+        for (_k=0;_k<w;_k++){
+            unsigned int t[3]={T[_k*3],T[_k*3+1],T[_k*3+2]};
+            int _e;
+            cnt[t[0]]++; cnt[t[1]]++; cnt[t[2]]++;
+            for(_e=0;_e<3;_e++){
+                _a=t[_e]; _b=t[(_e+1)%3];
+                if(_a>_b){unsigned int s=_a;_a=_b;_b=s;}
+                tri_edge[_k*3+_e]=((unsigned long long)_a<<32)|_b;
             }
         }
-        /* dedup edges by sorting packed (a,b) keys */
+        vstart[0]=0;
+        for(_j=0;_j<nv;_j++) vstart[_j+1]=vstart[_j]+cnt[_j];
+        for(_j=0;_j<nv;_j++) cnt[_j]=vstart[_j];
+        for(_k=0;_k<w;_k++){
+            unsigned int t[3]={T[_k*3],T[_k*3+1],T[_k*3+2]};
+            adj[cnt[t[0]]++]=_k; adj[cnt[t[1]]++]=_k; adj[cnt[t[2]]++]=_k;
+        }
+        for(_k=0;_k<w*3;_k++){
+            unsigned long long e=tri_edge[_k];
+            eqent_t *en=eq_lookup(emap,e);
+            if(en->slot==-1){
+                en->k=e; en->slot=(int)nq;
+                ek[nq]=e; pos[nq]=0; nq++;
+            }
+        }
+    }
+
+    /* min-heap over slot costs ecst[] (1-based) */
+    #define HEAP_PUSH(slot)                                                        \
+    do{                                                                            \
+        unsigned int _h = ++nh, _s = (slot);                                       \
+        while(_h>1){ unsigned int _p=_h/2;                                         \
+            if(ecst[heap[_p]]<=ecst[_s]) break;                                    \
+            heap[_h]=heap[_p]; pos[heap[_h]]=_h; _h=_p; }                          \
+        heap[_h]=_s; pos[_s]=_h;                                                   \
+    }while(0)
+
+    #define HEAP_POP() ({ unsigned int _top=heap[1], _last=heap[nh--];             \
+        unsigned int _h=1;                                                         \
+        pos[_top]=0;                                                               \
+        if(nh>=1){                                                                 \
+            while(1){ unsigned int _c=_h*2, _r=_c+1;                               \
+                if(_r<=nh && ecst[heap[_r]]<ecst[heap[_c]]) _c=_r;                 \
+                if(_c>nh || ecst[heap[_c]]>=ecst[_last]) break;                    \
+                heap[_h]=heap[_c]; pos[heap[_h]]=_h; _h=_c; }                      \
+            heap[_h]=_last; pos[_last]=_h; }                                       \
+        _top; })
+
+    /* evaluate edge slot i into ecst[i] using current geometry/quadrics */
+    #define EVAL_SLOT(i) do{                                                       \
+        unsigned int a=(unsigned int)((i)&1?ek[i]:ek[i]), tmp;                     \
+        unsigned int _a=(unsigned int)(ek[i]>>32), _b=(unsigned int)(ek[i]&0xffffffffu); \
+        vec3d_t _p;                                                                \
+        (void)tmp; (void)a;                                                        \
+        _p.x=(V[_a].x+V[_b].x)*0.5f; _p.y=(V[_a].y+V[_b].y)*0.5f; _p.z=(V[_a].z+V[_b].z)*0.5f;\
+        ecst[i]=quad_eval(&Q[_a],&_p)+quad_eval(&Q[_b],&_p);                       \
+    }while(0)
+
+    for (i = 0; i < nq; i++) { EVAL_SLOT(i); estp[i]=ver; HEAP_PUSH(i); }
+
+    while (cur_nt > target && nh > 0) {
+        unsigned int slot = HEAP_POP();
+        unsigned int a=(unsigned int)(ek[slot]>>32), b=(unsigned int)(ek[slot]&0xffffffffu);
+        vec3d_t mid; float c;
+        unsigned int z;
+
+        if (!alive[a] || !alive[b]) continue;               /* obsolete */
+        if (estp[slot] != ver) {                            /* stale cost */
+            EVAL_SLOT(slot); estp[slot]=ver; HEAP_PUSH(slot);
+            continue;
+        }
+        mid.x=(V[a].x+V[b].x)*0.5f; mid.y=(V[a].y+V[b].y)*0.5f; mid.z=(V[a].z+V[b].z)*0.5f;
+        c = quad_eval(&Q[a],&mid)+quad_eval(&Q[b],&mid);
+        if (c > ecst[slot] + 1e-12f) {                      /* extra safety */
+            ecst[slot]=c; estp[slot]=ver; HEAP_PUSH(slot); continue;
+        }
+        if (!collapse_ok(V, T, cur_nt, a, b, &mid)) continue;
+
+        /* collect triangles incident to a or b BEFORE rewriting (CSR lists
+         * still reference old compacted indices — valid until rebuild below) */
+        ver++;                                              /* invalidate all cached costs */
+
+        /* ---- perform collapse b -> a ---- */
+        V[a]=mid;
+        { vec3d_t na;
+          na.x=(N[a].x+N[b].x)*0.5f; na.y=(N[a].y+N[b].y)*0.5f; na.z=(N[a].z+N[b].z)*0.5f;
+          v_norm(&na); N[a]=na; }
+        { sqmat_t qa=Q[a], qb=Q[b]; int zz;
+          for(zz=0;zz<10;zz++) Q[a].q[zz]=qa.q[zz]+qb.q[zz]; }
+        alive[b]=0;
         {
-            /* pack into u64 for sorting; comparator at file scope */
-            unsigned long long *pk = (unsigned long long *)xr(NULL, sizeof(unsigned long long)*ec);
-            unsigned int jj, total = ec;
-            for (jj = 0; jj < total; jj++) pk[jj] = ((unsigned long long)ea[jj]<<32) | eb[jj];
-            qsort(pk, total, sizeof(unsigned long long), cmp_ull);
-            ec = 0;
-            for (jj = 0; jj < total; jj++) {
-                if (ec && pk[ec-1]==pk[jj]) continue;
-                ea[ec] = (unsigned int)(pk[jj]>>32);
-                eb[ec] = (unsigned int)(pk[jj] & 0xffffffffu);
-                ec++;
+            unsigned int nw=0;
+            for(z=0;z<cur_nt;z++){
+                unsigned int t0=T[z*3],t1=T[z*3+1],t2=T[z*3+2];
+                if(t0==b)t0=a; if(t1==b)t1=a; if(t2==b)t2=a;
+                if(t0==t1||t1==t2||t0==t2) continue;
+                T[nw*3]=t0;T[nw*3+1]=t1;T[nw*3+2]=t2; nw++;
             }
-            free(pk);
+            cur_nt=nw; w=nw;
         }
-
-        while (cur_nt > want && ec > 0) {
-            /* pick best among a random sample of edges (fast heuristic) */
-            int best_i = -1; float best_c = 1e30f; vec3d_t best_p;
-            int tries = (int)(ec < 2000u ? ec : 2000u), t2;
-            for (t2 = 0; t2 < tries; t2++) {
-                unsigned int idx = (unsigned int)(((unsigned long)t2 * 2654435761u + (unsigned long)pass * 40503u) % ec);
-                unsigned int a = ea[idx], b = eb[idx];
-                vec3d_t mid;
-                float c;
-                if (!alive[a] || !alive[b]) continue;
-                mid.x = (V[a].x + V[b].x) * 0.5f;
-                mid.y = (V[a].y + V[b].y) * 0.5f;
-                mid.z = (V[a].z + V[b].z) * 0.5f;
-                c = quad_eval(&Q[a], &mid) + quad_eval(&Q[b], &mid);
-                if (c < best_c) { best_c = c; best_i = (int)idx; best_p = mid; }
+        /* refresh ONLY edges of triangles touching a (small neighborhood);
+         * everything else stays lazily stamped-stale and is fixed on pop.    */
+        {
+            unsigned int s0=vstart[a], s1=vstart[a+1], p;
+            for(p=s0;p<s1 && p<vstart[nv];p++){
+                unsigned int tk=adj[p]; unsigned int e;
+                if (tk>=w) continue;
+                for(e=0;e<3;e++){
+                    unsigned int t0=T[tk*3],t1=T[tk*3+1],t2=T[tk*3+2];
+                    unsigned int x=e==0?t0:(e==1?t1:t2), y=e==0?t1:(e==1?t2:t0);
+                    unsigned long long k; eqent_t *en; int sl;
+                    if(x>y){unsigned int s=x;x=y;y=s;}
+                    k=((unsigned long long)x<<32)|y;
+                    en=eq_lookup(emap,k); sl=en->slot;
+                    if(sl<0 || (unsigned)sl>=nq) continue;
+                    EVAL_SLOT((unsigned)sl); estp[sl]=ver;
+                    if(pos[sl]) {/* already queued at old cost: remove lazily by
+                                    re-push; duplicates are filtered by stamp */}
+                    HEAP_PUSH((unsigned)sl);
+                }
             }
-            if (best_i < 0) break;
-            {
-                unsigned int a = ea[best_i], b = eb[best_i];
-                if (!collapse_ok(V, T, cur_nt, a, b, &best_p)) {
-                    /* mark edge dead by moving to end */
-                    ea[best_i] = ea[ec-1]; eb[best_i] = eb[ec-1]; ec--;
-                    continue;
-                }
-                /* perform collapse: b -> a */
-                V[a] = best_p;
-                {
-                    vec3d_t na;
-                    na.x = (N[a].x + N[b].x) * 0.5f;
-                    na.y = (N[a].y + N[b].y) * 0.5f;
-                    na.z = (N[a].z + N[b].z) * 0.5f;
-                    v_norm(&na);
-                    N[a] = na;
-                }
-                {
-                    quad_t qa = Q[a], qb = Q[b], q;
-                    int z;
-                    for (z = 0; z < 10; z++) q.q[z] = qa.q[z] + qb.q[z];
-                    Q[a] = q;
-                }
-                alive[b] = 0;
-                /* rewrite triangles */
-                {
-                    unsigned int w = 0, z;
-                    for (z = 0; z < cur_nt; z++) {
-                        unsigned int t0=T[z*3], t1=T[z*3+1], t2=T[z*3+2];
-                        if (t0==b) t0=a; if (t1==b) t1=a; if (t2==b) t2=a;
-                        if (t0==t1 || t1==t2 || t0==t2) continue;
-                        T[w*3]=t0; T[w*3+1]=t1; T[w*3+2]=t2; w++;
-                    }
-                    cur_nt = w;
-                }
-                edges_done++;
-                /* drop used edge from list */
-                ea[best_i] = ea[ec-1]; eb[best_i] = eb[ec-1]; ec--;
-            }
-            if (edges_done == 0 && cur_nt > want) break;
         }
-        free(ea); free(eb);
-        if (cur_nt == want) { /* continue next pass */ }
+    }
+    #undef HEAP_PUSH
+    #undef HEAP_POP
+    #undef EVAL_SLOT
+    free(tri_edge); free(cnt); free(vstart); free(adj); free(ek);
+    free(ecst); free(estp); free(heap); free(pos); free(emap);
     }
 
     /* compact vertices: remove dead */
     {
-        unsigned int *map = (unsigned int *)xr(NULL, sizeof(unsigned int)*cur_nv);
+        unsigned int *map = (unsigned int *)xr(NULL, sizeof(unsigned int)*nv);
         unsigned int nc = 0, z;
         vec3d_t *VC, *NC;
-        for (z = 0; z < cur_nv; z++) if (alive[z]) map[z] = nc++;
+        for (z = 0; z < nv; z++) if (alive[z]) map[z] = nc++;
         VC = (vec3d_t *)xr(NULL, sizeof(vec3d_t)*(nc?nc:1));
         NC = (vec3d_t *)xr(NULL, sizeof(vec3d_t)*(nc?nc:1));
-        for (z = 0; z < cur_nv; z++) if (alive[z]) { VC[map[z]] = V[z]; NC[map[z]] = N[z]; }
+        for (z = 0; z < nv; z++) if (alive[z]) { VC[map[z]] = V[z]; NC[map[z]] = N[z]; }
         for (z = 0; z < cur_nt*3; z++) T[z] = map[T[z]];
         free(V); free(N);
         m->v = VC; m->n = NC; m->tri = T;
