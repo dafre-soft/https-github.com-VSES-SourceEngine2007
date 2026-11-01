@@ -38,6 +38,25 @@ typedef struct { unsigned char b0, b1, b2, b3; } blendweight_c_t;
 #define STUDIOHDR_FLAGS_NO_FORCED_FADE     0x00000010
 #define STUDIOHDR_FLAGS_FORCE_OPACITY      0x00000020
 #define STUDIOHDR_FLAGS_HITBOX_COLLIDE     0x00000040
+/* studiomdl propcompile flags (studiohdr "flags" field, EP2 era):
+ * the engine ONLY generates . vtx on load when PROPCOMPILE_VTX is set;
+ * without it a static prop has no vertex layer and renders as nothing. */
+#define PROPCOMPILE_STATIC_PROP            0x00000001
+#define PROPCOMPILE_VERTEX_PROCESSING_INFO 0x00000002
+#define PROPCOMPILE_LIGHTMAP_SINGLE_PASS   0x00000004
+#define PROPCOMPILE_NO_CACHE               0x00000008
+#define PROPCOMPILE_FULL_OPTIMIZATION      0x00000010
+#define PROPCOMPILE_NO_FIXUP_CRACKS        0x00000020
+#define PROPCOMPILE_KEEP_SPLITTING         0x00000040
+#define PROPCOMPILE_KEEP_INDEX             0x00000080
+#define PROPCOMPILE_ONLY_SHADOWS           0x00000100
+#define PROPCOMPILE_NO_MERGE               0x00000200
+#define PROPCOMPILE_FORCE_NOobsidian       0x00000400
+#define PROPCOMPILE_FORCE_HARDOBSIDIAN     0x00000800
+#define PROPCOMPILE_RUN_STUDIODUMPPROPS    0x00001000
+#define PROPCOMPILE_LAZY_EXTRACT           0x00002000
+#define PROPCOMPILE_DONT_GENERATE_VTX      0x00004000
+#define PROPCOMPILE_VTX                    0x00008000
 #define TRANSLUCENT                        0x00000001
 #define MODELTRANSPARENCY_NONE             0
 #define MODELTRANSPARENCY_ALPHA            1
@@ -117,7 +136,7 @@ typedef struct {
     char        id[4];            /* "IDST"                                    */
     intu        version;          /* 48                                        */
     intu        checksum;
-    char        name[MDL_MAX_NAME];
+    char        szname[64];       /* studiohdr_t::szname — bytes[64], model name */
     intu        length;
     intu        eyeposition;      /* vec3d offset                             */
     intu        unused1;          /* (v48: unused)                              */
@@ -496,27 +515,44 @@ typedef struct {
     virtualmeshdesc_t meshdesc;
 } vvdheader_c_t;
 
+/* EXACT SDK layout (vphysics/vmodelinfo): 280 bytes, no padding holes. */
 typedef struct {
-    intu        size;
-    intu        sizefixup;
-    char        name[MDL_MAX_NAME];
-    intu        hedat;
-    intu        heder;
-    intu        fdat;
-    intu        fer;
-    intu        _pad[4];
+    intu        size;                                   /* = sizeof this struct      */
+    intu        sizefixup;                              /* = sizeof fixup vertex rec */
+    char        name[MDL_MAX_NAME];                     /* "vFixupHeader"            */
+    vec3d_t     origin;                                 /* model origin              */
+    float       scale;                                  /* model scale               */
+    intu        maxweightcount;                         /* 1 for static props        */
+    intu        verttablesize;                          /* # fixup vertices          */
+    intu        triangletablesize;                      /* # fixup triangles         */
+    intu        fixupcacheoffset;                       /* -> vFixupCache            */
+    intu        vertexidstableoffset;                   /* -> vVertexIDS             */
+    intu        triangleidstableoffset;                 /* -> vTriangleIDS           */
+    intu        vertextransformsoffset;                 /* -> vTransforms            */
+    intu        vertextransformscount;                  /* == verttablesize          */
+    intu        triangletransformsoffset;               /* -> vTransforms            */
+    intu        triangletransformscount;                /* == triangletablesize      */
+    intu        _pad[47];                               /* pad to 280 bytes          */
 } virtualmeshfixupheader_t;
 
+/* EXACT SDK layout (virtualmeshfixupvertex_t): 40 bytes. */
 typedef struct {
-    intu        vertexid;
-    intu        triangleid;
-    unsigned short vertexfixup;
-    unsigned short trianglefixup;
-    vec3d_t     pos;
-    blendweight_c_t boneWeight;
-    unsigned char   boneIndex[4];
-    intu        _pad;
+    intu            vertexid;
+    intu            triangleid;
+    unsigned short  vertexfixup;
+    unsigned short  trianglefixup;
+    vec3d_t         pos;
+    float           flWeight[4];
+    unsigned char   unBone[4];
 } virtualmeshfixupvertex_t;
+
+/* vFixupCache record: 16 bytes */
+typedef struct {
+    intu        vertindexstart;
+    intu        vertindexcount;
+    intu        triindexstart;
+    intu        triindexcount;
+} virtualmeshfixupcache_t;
 
 /* ------------------------------------------------------------ collision */
 typedef struct {

@@ -130,7 +130,12 @@ int write_mdl_vvd(const char *basepath, const mesh_t *vis, mesh_t *lods[],
       patch32(&W.b,hb_off+offsetof(mstudiohitboxset_c_t,hitboxoffset),(int)W.b.size);
       buf_put(&W.b,&bb,sizeof bb);
       patch32(&W.b,offsetof(studiohdr_c_t,hitboxsetoffset),(int)hb_off);
-      { int fl=STUDIOHDR_FLAGS_HITBOX_SET|STUDIOHDR_FLAGS_HITBOX_COLLIDE;
+      /* PROPCOMPILE flags: STATIC_PROP + VERTEX_PROCESSING_INFO + VTX is what
+       * makes HL2 (EP2 branch) build the .vtx vertex layer on model load. */
+      { int fl=STUDIOHDR_FLAGS_HITBOX_SET|STUDIOHDR_FLAGS_HITBOX_COLLIDE|
+               PROPCOMPILE_STATIC_PROP|PROPCOMPILE_VERTEX_PROCESSING_INFO|
+               PROPCOMPILE_VTX;
+        if (o->nomerge) fl |= PROPCOMPILE_NO_MERGE;
         patch32(&W.b,offsetof(studiohdr_c_t,flags),fl); } }
 
     /* 7. bodyparts */
@@ -380,15 +385,15 @@ int write_mdl_vvd(const char *basepath, const mesh_t *vis, mesh_t *lods[],
 
     /* strings at EOF, then length/checksum */
     { long slen; const void *sdat; studiohdr_c_t *h;
-      char nm[MDL_MAX_NAME];
+      char nm[64];
       const char *base = strrchr(o->out, '/');
       const char *bs2  = strrchr(o->out, '\\');
       memcpy(W.b.data,IDSTUDIOHEADER,4);
       patch32(&W.b,offsetof(studiohdr_c_t,version),STUDIOHDR_VERSION);
       /* szname must be the bare model name (no path): strip it. */
       if (bs2 && (!base || bs2 > base)) base = bs2;
-      strncpy(nm, base ? base + 1 : o->out, MDL_MAX_NAME - 1);
-      nm[MDL_MAX_NAME - 1] = '\0';
+      strncpy(nm, base ? base + 1 : o->out, 63);
+      nm[63] = 0;
       strncpy((char*)W.b.data+offsetof(studiohdr_c_t,name),nm,MDL_MAX_NAME-1);
       sdat=str_table_data(&slen);
       buf_pad(&W.b,4); buf_put(&W.b,sdat,slen);
@@ -478,6 +483,83 @@ int write_mdl_vvd(const char *basepath, const mesh_t *vis, mesh_t *lods[],
       { vec3d_t up={0,0,1}; buf_put(&vb,&up,sizeof up);
         patch32(&vb,offsetof(vvdheader_c_t,meshdesc.rootnormal),(int)rn);
         patch32(&vb,offsetof(vvdheader_c_t,meshdesc.rootnormalcount),1); }
+
+      /* ---- fixup lumps (SDK order, per studiomdl write_vvd.cpp) ----------
+       * vFixupInfo(280) -> vFixupHeader(280) -> vFixupVertexData ->
+       * vFixupTriangleData -> vFixupCache -> vTransforms -> vVertexIDS ->
+       * vTriangleIDS.  The EP2 vtx loader (vertexmemory.cpp) fails with
+       * "Error opening VVD file" unless every one of these is present. */
+      { long finfo_off,fhdr_off,fv_off,ft_off,fcache_off,ftr_off,fvids_off,ftids_off;
+        unsigned int vrun=0,trun=0;
+        buf_pad(&vb,4); finfo_off=vb.size;
+        buf_put(&vb,&fh,sizeof fh);           /* vFixupInfo: already zeroed */
+
+        buf_pad(&vb,4); fhdr_off=vb.size;
+        { virtualmeshfixupheader_t fxh;
+          memset(&fxh,0,sizeof fxh);
+          strcpy(fxh.name,"vFixupHeader");
+          fxh.size=(int)sizeof fxh;
+          fxh.sizefixup=(int)sizeof(virtualmeshfixupvertex_t);
+          fxh.origin=mid; fxh.scale=1.0f; fxh.maxweightcount=1;
+          buf_put(&vb,&fxh,sizeof fxh); }
+
+        buf_pad(&vb,4); fv_off=vb.size;
+        for (i=0;i<(unsigned int)total_lods;i++) {
+          const mesh_t *m=(i==0)?vis:lods[i-1]; unsigned int k;
+          for (k=0;k<m->nv;k++) {
+            virtualmeshfixupvertex_t fv; memset(&fv,0,sizeof fv);
+            fv.vertexid=(int)(vrun+k); fv.triangleid=-1;
+            fv.vertexfixup=0; fv.trianglefixup=0; fv.pos=m->v[k];
+            fv.flWeight[0]=1.0f;
+            fv.unBone[0]=0; fv.unBone[1]=fv.unBone[2]=fv.unBone[3]=(unsigned char)0xFF;
+            buf_put(&vb,&fv,sizeof fv);
+          }
+          vrun+=lod_nvert[i];
+        }
+
+        buf_pad(&vb,4); ft_off=vb.size;
+        for (i=0;i<(unsigned int)total_lods;i++) {
+          const mesh_t *m=(i==0)?vis:lods[i-1]; unsigned int k;
+          for (k=0;k<m->nt;k++) { intu ft; ft=(int)(trun+k); buf_put(&vb,&ft,sizeof ft); }
+          trun+=lod_ntri[i];
+        }
+
+        buf_pad(&vb,4); fcache_off=vb.size;
+        { virtualmeshfixupcache_t fc; unsigned int vend=0,tend=0;
+          for (i=0;i<(unsigned int)total_lods;i++) {
+            memset(&fc,0,sizeof fc);
+            fc.vertindexstart=(int)vend; fc.vertindexcount=(int)lod_nvert[i];
+            fc.triindexstart=(int)tend;  fc.triindexcount=(int)lod_ntri[i];
+            buf_put(&vb,&fc,sizeof fc);
+            vend+=lod_nvert[i]; tend+=lod_ntri[i];
+          } }
+
+        buf_pad(&vb,4); ftr_off=vb.size;   /* one identity transform per vertex/tri */
+        { float ident[12]={1,0,0,0, 0,1,0,0, 0,0,1,0}; unsigned int k;
+          for (k=0;k<vrun+trun;k++) buf_put(&vb,ident,sizeof ident); }
+
+        buf_pad(&vb,4); fvids_off=vb.size;
+        { intu id; for (id=0;(unsigned)id<vrun;id++) buf_put(&vb,&id,sizeof id); }
+        buf_pad(&vb,4); ftids_off=vb.size;
+        { intu id; for (id=0;(unsigned)id<trun;id++) buf_put(&vb,&id,sizeof id); }
+
+        /* patch vFixupInfo copy (at file start) and the trailing vMeshDesc copy */
+        patch32(&vb,offsetof(vvdheader_c_t,meshdesc)+offsetof(virtualmeshdesc_t,fixup),(int)finfo_off);
+        patch32(&vb,offsetof(vvdheader_c_t,meshdesc)+offsetof(virtualmeshdesc_t,fixupcount),1);
+#define FIXPATCH(field,val) do{ \
+        patch32(&vb,finfo_off+offsetof(virtualmeshfixupheader_t,field),(int)(val)); \
+        patch32(&vb,fhdr_off +offsetof(virtualmeshfixupheader_t,field),(int)(val)); }while(0)
+        FIXPATCH(vertextransformsoffset,ftr_off);
+        FIXPATCH(vertextransformscount,vrun);
+        FIXPATCH(triangletransformsoffset,ftr_off+(long)vrun*48);
+        FIXPATCH(triangletransformscount,trun);
+        FIXPATCH(verttablesize,vrun);
+        FIXPATCH(triangletablesize,trun);
+        FIXPATCH(fixupcacheoffset,fcache_off);
+        FIXPATCH(vertexidstableoffset,fvids_off);
+        FIXPATCH(triangleidstableoffset,ftids_off);
+#undef FIXPATCH
+      }
 
       buf_pad(&vb,4); ma2=vb.size;
       buf_put(&vb,&vh.meshdesc,sizeof(virtualmeshdesc_t));
