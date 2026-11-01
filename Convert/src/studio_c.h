@@ -372,15 +372,19 @@ typedef struct {
     intu        _pad;
 } mstudiovertex_t;
 
+/* EXACT 48-byte on-disk VVD vertex, identical layout to mstudiovertex_t:
+ * float weights[4] (16B) + char bone[4] (4B) + pad(4B)? -- see studio.h:
+ * mstudioboneweight_t = float weight[4]; char bone[4]; byte numbones; +pad
+ * then Vector pos, Vector normal, Vector2D uv. */
 typedef struct {
+    fltim       weight[4];
+    unsigned char bone[4];
+    unsigned char numbones;
+    unsigned char pad[3];
     vec3d_t     pos;
     vec3d_t     normal;
-    vec4d_t     tangent;
-    unsigned short s, t;
-    blendweight_c_t boneWeight;
-    unsigned char   boneIndex[4];
-    unsigned char   _pad[3];
-} virtualmeshvertex_t;
+    fltim       u, v;
+} vvdvertex_c_t;
 
 typedef struct {
     intu        vertexoffset;
@@ -497,17 +501,6 @@ typedef struct {
 } mstudiohitboxset_c_t;
 
 /* -------------------------------------------------------------- textures */
-typedef struct {
-    intu        width;
-    intu        height;
-    intu        depth;
-    intu        flags;
-    intu        numframes;
-    intu        bbox;
-    intu        unpackedsize;
-    intu        _pad;
-} mstudio纹理placeholder_t; /* renamed below to avoid non-ascii */
-
 typedef struct {
     intu        width;
     intu        height;
