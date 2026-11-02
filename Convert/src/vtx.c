@@ -3,7 +3,7 @@
  * gordon2-era studiomdl vertexwrite.cpp, trimmed to a fully static model:
  * 1 bodypart, 1 model, 1 material group per LOD, no bones, no flex.
  * Without a .vtx the engine loads the .mdl but draws nothing at all.
- * VVP version 64 = HL2/EP1 range; matches our studiohdr v48 + VVD v4 output.
+ * VVP version 64 = HL2/EP1 range; matches studiohdr v48 + VVD v4 output.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,7 +17,7 @@ typedef unsigned short u16;
 typedef int32_t v32;   /* VVP fields are always 4 bytes */
 
 #define VVP_VERSION 64
-#define VVP_ID      0x50564844L   /* MAKEID('V','P','H','D') as Valve writes it */
+#define VVP_ID      0x44485056L   /* MAKEID('V','P','H','D') little-endian */
 
 enum { MODELVERT_TYPE_3D = 0 };
 enum { STRIP_TABLE_FIXUP_LIST = 0 };
@@ -28,17 +28,11 @@ typedef struct {                       /* VertexFileHeader_t */
     v32 entrysize, numentries;
     v32 vertcacheofs;                 /* abs -> VertCacheHeader_t */
     v32 lodofs;                       /* abs -> LodLevel_t chain root */
-    /* MatRepData header inline: materiallist member is the first of the four
-       matrep longs; matreldataoffset is stored BEFORE it in our writer but
-       on-disk layout per VVP64: [materiallist][matreldataoffset? ] -- use the
-       canonical order from vertex_file_layout_public.h: */
-    v32 pad_matrep;                   /* matreldataoffset: written by patch below */
-    v32 materiallist;                 /* strlen of list-name string incl NUL */
-    v32 skins, materials;             /* on-disk matrep hdr = these 4 ints;
-                                         matreldataoffset is the one BEFORE them? No:
-                                         VVP64 layout is [dataoffset][strlen][skins][mats]
-                                         with dataoffset rel to &strlen. We store it in
-                                         pad_matrep and compute vs &materiallist. */
+    /* MatRepData inline: [dataoffset][strlen][skins][materials];
+       dataoffset is relative to the address OF THE STRLEN FIELD itself */
+    v32 matreldataoffset;
+    v32 materiallist_strlen;          /* strlen of list-name string incl NUL */
+    v32 skins, materials;
     v32 bodypartcount;
 } vvp_header_t;                        /* 56 bytes */
 typedef int vvp_header_size_check[ (sizeof(vvp_header_t)==56) ? 1 : -1 ];
@@ -81,17 +75,17 @@ typedef struct {                       /* ModelData_t (rel offsets to VertCacheH
     v32 vertblockheaderofs;
     v32 stripindexblockheaderofs;
     v32 fixupblockheaderofs;
-    v32 materialdataofs;              /* -> LodMaterialGroup_t[1] */
+    v32 materialdataofs;              /* -> MaterialListHeader_t */
     v32 numlodrecords;
     v32 lodrecordfirstofs;            /* -> LODFlexRecord_t[] */
     v32 maxscale;
 } vvp_mdata_t;                         /* 32 bytes */
 
-typedef struct {                       /* LODFlexRecord_t */
-    v32 flexcount, flexindexfirstofs;
+typedef struct {                       /* LODFlexRecord_t (VVP64: 12 bytes) */
     v32 lodlevel;                     /* rel VertCacheHdr -> LodLevel_t */
-    v32 numswitchvertices, switchvertexfirstofs;
+    v32 flexcount, flexindexfirstofs;
 } vvp_lodrec_t;
+typedef int vvp_lodrec_size_check[(sizeof(vvp_lodrec_t)==12)?1:-1];
 
 typedef struct {                       /* LodLevel_t */
     float switchpoint;                 /* dist where NEXT lod takes over */
@@ -118,6 +112,12 @@ typedef struct {                       /* TriStip_t: u16 indices follow at index
 } vvp_tip_t;
 
 typedef struct { v32 size, count; } vvp_psz_t;   /* MaterialProxySize_t */
+
+typedef struct { v32 listlen; } vvp_mlhdr_t;     /* MaterialListHeader_t:
+    then: list name chars[listlen] (NUL-terminated), 4-align,
+          MaterialEntry_t[nummaterials]: { v32 namelen; char name[namelen]; } 4-aligned each,
+          then skinFamilies: v32 numFamilies, then per family:
+             v32 numMaterials, v32 w, v32 h, v32 sz, then per material: v32 arrayIndex */
 #pragma pack(pop)
 
 /* ---- dynamic byte buffer ---- */
@@ -142,8 +142,8 @@ int vtx_write(const char *basepath, const mesh_t *vis, mesh_t *lods[],
     unsigned int cum_v = 0, cum_t = 0;
     unsigned int lod_voff[8], lod_nv[8], lod_nt[8];
     long vb_hdr_pos, si_hdr_pos, fu_hdr_pos, vc_pos, bpd_pos, md_pos, lr_pos;
-    long lvl_r[8], matgrp_r, ts_r, px_r, ml_pos;
-    long vb_arr, vb_blobarr_off;
+    long lvl_r[8], ml_pos;
+    long vb_arr;
     long verts_base, idxs_base, rest_base;
     char matline[256];
     long matlen;
@@ -195,8 +195,7 @@ int vtx_write(const char *basepath, const mesh_t *vis, mesh_t *lods[],
 
     /* ===== VertBlockHeader + entries pairs + blob ofs[] ===== */
     vb_hdr_pos=head.len;
-    vb_blobarr_off=(long)sizeof(vvp_vbhdr_t)+total_lods*8;   /* after hdr + entry pairs */
-    vb_arr=vb_hdr_pos+vb_blobarr_off;
+    vb_arr=vb_hdr_pos+(long)sizeof(vvp_vbhdr_t)+total_lods*8;
     { vvp_vbhdr_t vb; memset(&vb,0,sizeof vb);
       vb.numblobs=total_lods; vb.verttype=MODELVERT_TYPE_3D; vb.vertsize=32;
       vb.vertlocalofs=(long)sizeof(vvp_vblob_t);
@@ -263,8 +262,9 @@ int vtx_write(const char *basepath, const mesh_t *vis, mesh_t *lods[],
     for(i=0;i<total_lods;i++){
         const mesh_t *m=(i==0)?vis:lods[i-1];
         unsigned int k; long bs=idxs.len;
-        mb_i32(&idxs,(long)m->nt*3);
-        mb_i32(&idxs,8);
+        vvp_siblob_t sh;
+        sh.numindices=(long)m->nt*3; sh.indexdataofs=8;  /* u16[] starts right after hdr */
+        mb_put(&idxs,&sh,sizeof sh);
         for(k=0;k<m->nt;k++){
             mb_u16(&idxs,(u16)(m->tri[k*3+0]+lod_voff[i]));
             mb_u16(&idxs,(u16)(m->tri[k*3+1]+lod_voff[i]));
@@ -288,54 +288,45 @@ int vtx_write(const char *basepath, const mesh_t *vis, mesh_t *lods[],
         memcpy(head.d+fu_hdr_pos+sizeof(vvp_fuhdr_t)+i*4,&bs,4);
     }
 
-    /* ===== material group (LodMaterialGroup_t[1]) + tristrips -> REST ===== */
-    matgrp_r=rest.len;
-    mb_i32(&rest,0); mb_i32(&rest,0); mb_i32(&rest,0);      /* placeholder mg[0] */
-    ts_r=rest.len;
-    { vvp_ts_t ts; vvp_tip_t tip;
-      ts.numtristrips=1; ts.stripsfirstofs=sizeof(ts);
-      ts.numtrifans=0;   ts.fansfirstofs=0;
-      ts.numisolatedtris=0; ts.trisfirstofs=0;
-      mb_put(&rest,&ts,sizeof ts);
-      tip.numindices=(long)lod_nt[0]*3; tip.indexstartofs=sizeof(tip);
-      mb_put(&rest,&tip,sizeof tip);
-      { const mesh_t *m=vis; unsigned int k;
-        for(k=0;k<m->nt;k++){
-            mb_u16(&rest,(u16)m->tri[k*3+0]);
-            mb_u16(&rest,(u16)m->tri[k*3+1]);
-            mb_u16(&rest,(u16)m->tri[k*3+2]);
+    /* ===== per-LOD tristrips + proxy (shared data blocks) -> REST ===== */
+    {
+        long ts_abs[8], px_abs[8];
+        for(i=0;i<total_lods;i++){
+            const mesh_t *m=(i==0)?vis:lods[i-1];
+            vvp_ts_t ts; vvp_tip_t tip; vvp_psz_t psz;
+            unsigned int k;
+            ts_abs[i]=rest.len;
+            ts.numtristrips=1; ts.stripsfirstofs=sizeof(ts);
+            ts.numtrifans=0;   ts.fansfirstofs=0;
+            ts.numisolatedtris=0; ts.trisfirstofs=0;
+            mb_put(&rest,&ts,sizeof ts);
+            tip.numindices=(long)m->nt*3; tip.indexstartofs=sizeof(tip);
+            mb_put(&rest,&tip,sizeof tip);
+            for(k=0;k<m->nt;k++){
+                mb_u16(&rest,(u16)(m->tri[k*3+0]+lod_voff[i]));
+                mb_u16(&rest,(u16)(m->tri[k*3+1]+lod_voff[i]));
+                mb_u16(&rest,(u16)(m->tri[k*3+2]+lod_voff[i]));
+            }
+            mb_pad4(&rest);
+            px_abs[i]=rest.len;
+            psz.size=0; psz.count=0; mb_put(&rest,&psz,sizeof psz);
         }
-        mb_pad4(&rest); }
-    }
-    mb_pad4(&rest);
-    px_r=rest.len;
-    { vvp_psz_t psz; psz.size=0; psz.count=0; mb_put(&rest,&psz,sizeof psz); }
-    { long a=ts_r-matgrp_r, b=px_r-matgrp_r, c=0;
-      memcpy(rest.d+matgrp_r+0,&a,4);
-      memcpy(rest.d+matgrp_r+4,&b,4);
-      memcpy(rest.d+matgrp_r+8,&c,4); }
-
-    /* ===== LOD tree: LodLevel_t per record, chained -> REST ===== */
-    for(i=0;i<total_lods;i++){
-        vvp_lodlvl_t lv; vvp_lomg_t mg2;
-        lvl_r[i]=rest.len;
-        lv.switchpoint = (i==total_lods-1) ? 1e9f : 500.0f*(float)(i+1);
-        lv.nummaterialgroups=1;
-        lv.materialgroupfirstofs=sizeof(lv);
-        lv.maxscale=1;
-        lv.nextLODOffset = (i==total_lods-1)?0:(long)(sizeof(lv)+sizeof(mg2));
-        mb_put(&rest,&lv,sizeof lv);
-        memset(&mg2,0,sizeof mg2);
-        mg2.tristripsofs=0; mg2.propertyofs=0; mg2.material=0;
-        /* LodMaterialGroup inside LodLevel points REL TO ITSELF at the same
-           material data we wrote once: recompute relative distance */
-        { long d0 = matgrp_r - (rest.len); /* target abs minus mg abs */
-          /* mg will sit at rest.len now; its fields are rel to itself */
-          long ts_rel = ts_r - rest.len;
-          long px_rel = px_r - rest.len;
-          mg2.tristripsofs=ts_rel; mg2.propertyofs=px_rel;
-          (void)d0; }
-        mb_put(&rest,&mg2,sizeof mg2);
+        /* ===== per-LOD LodLevel_t with inline LodMaterialGroup_t ===== */
+        for(i=0;i<total_lods;i++){
+            vvp_lodlvl_t lv; vvp_lomg_t mg;
+            long lvabs=rest.len;
+            lvl_r[i]=lvabs;
+            lv.switchpoint = (i==total_lods-1) ? 1e9f : 500.0f*(float)(i+1);
+            lv.nummaterialgroups=1;
+            lv.materialgroupfirstofs=(v32)sizeof(lv);
+            lv.maxscale=1;
+            lv.nextLODOffset = (i==total_lods-1)?0:(v32)(sizeof(lv)+sizeof(mg));
+            mb_put(&rest,&lv,sizeof lv);
+            mg.tristripsofs = (v32)(ts_abs[i] - lvabs - (long)sizeof(lv));
+            mg.propertyofs  = (v32)(px_abs[i] - lvabs - (long)sizeof(lv));
+            mg.material = 0;
+            mb_put(&rest,&mg,sizeof mg);
+        }
     }
     /* patch LODFlexRecord.lodlevel (rel to VertCacheHeader) */
     for(i=0;i<total_lods;i++){
@@ -344,12 +335,23 @@ int vtx_write(const char *basepath, const mesh_t *vis, mesh_t *lods[],
         memcpy(head.d+recp+offsetof(vvp_lodrec_t,lodlevel),&rel,4);
     }
 
-    /* ===== material list strings -> REST ===== */
+    /* ===== MaterialListHeader + names + skin families -> REST ===== */
     ml_pos=rest.len;
-    mb_put(&rest,matline,matlen); mb_pad4(&rest);     /* "list name" (model matname) */
-    mb_i32(&rest,matlen);                              /* length of material[0] name+1 */
-    mb_put(&rest,matline,matlen); mb_pad4(&rest);
-    mb_i32(&rest,0);                                   /* skin family 0 -> material 0 */
+    { vvp_mlhdr_t mh;
+      mh.listlen=(v32)matlen;
+      mb_put(&rest,&mh,sizeof mh);
+      mb_put(&rest,matline,matlen); mb_pad4(&rest);
+      /* one material entry */
+      mb_i32(&rest,matlen);
+      mb_put(&rest,matline,matlen); mb_pad4(&rest);
+      /* skin families: 1 family, 1 material, arrayIndex 0 */
+      mb_i32(&rest,1);          /* numFamilies */
+      mb_i32(&rest,1);          /* numMaterials in family */
+      mb_i32(&rest,1);          /* width */
+      mb_i32(&rest,1);          /* height */
+      mb_i32(&rest,1);          /* sz */
+      mb_i32(&rest,0);          /* arrayIndex[0] */
+    }
 
     /* ===== assembly ===== */
     verts_base=head.len;
@@ -366,17 +368,16 @@ int vtx_write(const char *basepath, const mesh_t *vis, mesh_t *lods[],
       for(i=0;i<total_lods;i++){ long v; memcpy(&v,head.d+arr+i*4,4); v+=rest_base-fu_hdr_pos; memcpy(head.d+arr+i*4,&v,4); } }
 
     /* ModelData.materialdataofs (rel to VertCacheHeader) */
-    { long v=rest_base+matgrp_r-vc_pos;
+    { long v=rest_base+ml_pos-vc_pos;
       memcpy(head.d+md_pos+offsetof(vvp_mdata_t,materialdataofs),&v,4); }
 
     /* header.lodofs = first LodLevel absolute */
     { long v=rest_base+lvl_r[0];
       memcpy(head.d+offsetof(vvp_header_t,lodofs),&v,4); }
 
-    /* header MatRepData: [dataoffset][strlen][skins][materials];
-       dataoffset is relative to the address OF THE STRLEN FIELD itself */
-    { ST32(head.d+offsetof(vvp_header_t,pad_matrep),(rest_base+ml_pos)-(long)offsetof(vvp_header_t,materiallist));
-      ST32(head.d+offsetof(vvp_header_t,materiallist),matlen);
+    /* header MatRepData */
+    { ST32(head.d+offsetof(vvp_header_t,matreldataoffset),(rest_base+ml_pos)-(long)offsetof(vvp_header_t,materiallist_strlen));
+      ST32(head.d+offsetof(vvp_header_t,materiallist_strlen),matlen);
       ST32(head.d+offsetof(vvp_header_t,skins),1);
       ST32(head.d+offsetof(vvp_header_t,materials),1);
     }
