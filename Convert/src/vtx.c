@@ -23,21 +23,30 @@ enum { MODELVERT_TYPE_3D = 0 };
 enum { STRIP_TABLE_FIXUP_LIST = 0 };
 
 #pragma pack(push,1)
-typedef struct {                       /* VertexFileHeader_t */
+typedef struct {                       /* VertexFileHeader_t — canonical SDK layout */
     v32 id, version, clientversion, flags, contentflags;
     v32 entrysize, numentries;
-    v32 vertcacheofs;                 /* abs -> VertCacheHeader_t */
-    v32 lodofs;                       /* abs -> LodLevel_t chain root */
-    /* MatRepData inline: [dataoffset][strlen][skins][materials];
-       dataoffset is relative to the address OF THE STRLEN FIELD itself */
+    v32 vertcacheofs;                  /* ABS file offset -> VertCacheHeader_t */
+    v32 lodofs;                        /* ABS file offset -> LodLevel_t chain root */
+    /* MatRepData inline block: [dataoffset][strlen][numSkins][numMaterials].
+       dataoffset is stored RELATIVE TO THE ADDRESS OF THE STRLEN FIELD. */
     v32 matreldataoffset;
-    v32 materiallist_strlen;          /* strlen of list-name string incl NUL */
-    v32 skins, materials;
+    v32 materiallist_strlen;           /* strlen of list-name string incl NUL */
+    v32 num_skins, num_materials;
     v32 bodypartcount;
-} vvp_header_t;                        /* 56 bytes */
+} vvp_header_t;                        /* 56 bytes — engine reads exactly this */
 typedef int vvp_header_size_check[ (sizeof(vvp_header_t)==56) ? 1 : -1 ];
 
-typedef struct {                       /* VertCacheHeader_t */
+typedef struct {                       /* VertCacheHeader_t — canonical SDK layout
+                                        (verified against gordon2 vertex_file_layout) */
+    v32 vertblockheaderofs;            /* all eight: RELATIVE to VertCacheHeader */
+    v32 stripindexblockheaderofs;
+    v32 fixupblockheaderofs;
+    v32 bodypartofs;
+    v32 num_bone_flex_controller_descs;
+    v32 boneflexcontrollerdescfirstofs;
+    v32 num_bone_flex_pair_descs;
+    v32 boneflexpairdescfirstofs;
     v32 maxnum_bones_per_hardware_vb;
     v32 maxnum_bones_per_software_vb;
     v32 maxnum_bones_per_strip;
@@ -46,28 +55,28 @@ typedef struct {                       /* VertCacheHeader_t */
     v32 maxnum_tris_per_hw_vb;
     v32 maxmodeldeform;
     v32 maxscale;                      /* VertexFileHeader_t::maxscale */
-    v32 vertblockheaderofs;           /* these four: rel to VertCacheHeader */
-    v32 stripindexblockheaderofs;
-    v32 fixupblockheaderofs;
-    v32 bodypartofs;
-} vvp_vc_t;                            /* 48 bytes */
-typedef int vvp_vc_size_check[(sizeof(vvp_vc_t)==48)?1:-1];
+} vvp_vc_t;                            /* 64 bytes */
+typedef int vvp_vc_size_check[(sizeof(vvp_vc_t)==64)?1:-1];
 
 typedef struct {                       /* VertBlockHeader_t */
-    v32 numblobs, blobarrayofs;       /* blobarrayofs rel to this header */
-    v32 verttype, vertsize;
-    v32 vertflagsofs, vertlocalofs;   /* vertlocalofs rel to each blob start */
-    v32 vertboneofsofs, vertbonecntofs, vertlightofs;
-} vvp_vbhdr_t;                         /* 36 bytes; then entries pairs, then ofs[] */
+    v32 numblobs, blobarrayofs;       /* both rel to THIS header */
+    v32 verttype, vertsize;           /* vertsize = sizeof(modelvertex_t)=32 */
+    v32 vertflagsofs;                 /* rel to header -> uint32 vertflags[nv] */
+    v32 vertlocalofs;                 /* REL TO EACH BLOB START -> vertex data */
+    v32 vertboneofsofs;               /* rel to header -> bone-influence arrays */
+    v32 vertbonecntofs;               /* rel to header -> byte count-per-vertex */
+    v32 vertlightofs;                 /* rel to header -> ambient light array */
+} vvp_vbhdr_t;                         /* 36 bytes; then {count,-1} pairs, then ofs[] */
 typedef int vvp_vbhdr_size_check[(sizeof(vvp_vbhdr_t)==36)?1:-1];
 
 typedef struct { v32 datalen; } vvp_vblob_t;   /* then pos(3f),nrm(3f),tex(2f)/vert */
 typedef struct { v32 numblobs, blobarrayofs; } vvp_sihdr_t;
 typedef struct { v32 numindices, indexdataofs; } vvp_siblob_t; /* idx rel to blob */
-typedef struct { v32 numblobs, blobarrayofs; } vvp_fuhdr_t;
-typedef struct { v32 numfixups, fixupsofs; } vvp_fublob_t;
-typedef struct { v32 destofs, sourceofs; } vvp_sd_t;
-typedef struct { v32 fixuptype, numsources, nextoffset, firstsourcedestofs; } vvp_fixup_t;
+typedef struct { v32 numblobs, blobarrayofs; } vvp_fuhdr_t;   /* FixupBlockHeader_t */
+typedef struct { v32 numfixups, firstfixupofs; } vvp_fublob_t;/* StripFixupHeader_t */
+typedef struct { v32 destoffset, sourceoffset; } vvp_sd_t;    /* SourceDestListEntry_t */
+/* StripFixup_t: union{type} + nextfixupoffset + numindexes + indexlistofs */
+typedef struct { v32 fixuptype, nextfixupoffset, numindexes, indexlistofs; } vvp_fixup_t;
 
 typedef struct { v32 modelcount, modelfirstofs; } vvp_bpdata_t; /* ofs rel to self */
 
@@ -169,25 +178,25 @@ int vtx_write(const char *basepath, const mesh_t *vis, mesh_t *lods[],
 
     mb_init(&head); mb_init(&verts); mb_init(&idxs); mb_init(&rest);
 
-    /* ===== file header + 16B per-entry limits block ===== */
+    /* ===== file header (56 B, canonical VertexFileHeader_t) ===== */
     { vvp_header_t vh; memset(&vh,0,sizeof vh);
       vh.id=VVP_ID; vh.version=VVP_VERSION;
       vh.contentflags=0x1;             /* CONTENTS_SOLID */
-      vh.entrysize=(v32)(sizeof(vvp_header_t)+16);   /* 56+16 = 72 */
+      vh.entrysize=(v32)sizeof(vvp_header_t);        /* 56 */
       vh.numentries=1;
-      vh.vertcacheofs=vh.entrysize;
+      vh.vertcacheofs=vh.entrysize;    /* VertCacheHeader right after */
       vh.bodypartcount=1;
+      vh.num_skins=1; vh.num_materials=1;
       mb_put(&head,&vh,sizeof vh);
-      { u8 ff[16]; memset(ff,0xFF,16); mb_put(&head,ff,16); }
     }
 
     /* ===== VertCacheHeader ===== */
     vc_pos=head.len;
     { vvp_vc_t vc; memset(&vc,0,sizeof vc);
-      vc.maxnum_bones_per_hardware_vb=0xFFFF;
-      vc.maxnum_bones_per_software_vb=0xFFFF;
-      vc.maxnum_bones_per_strip=0xFFFF;
-      vc.maxnum_bones_per_triangles=0xFFFF;
+      vc.maxnum_bones_per_hardware_vb=1;   /* static model: single implicit bone */
+      vc.maxnum_bones_per_software_vb=1;
+      vc.maxnum_bones_per_strip=1;
+      vc.maxnum_bones_per_triangles=1;
       vc.maxnum_verts_per_hw_vb=cum_v;
       vc.maxnum_tris_per_hw_vb=cum_t;
       mb_put(&head,&vc,sizeof vc);
@@ -198,7 +207,22 @@ int vtx_write(const char *basepath, const mesh_t *vis, mesh_t *lods[],
     vb_arr=vb_hdr_pos+(long)sizeof(vvp_vbhdr_t)+total_lods*8;
     { vvp_vbhdr_t vb; memset(&vb,0,sizeof vb);
       vb.numblobs=total_lods; vb.verttype=MODELVERT_TYPE_3D; vb.vertsize=32;
-      vb.vertlocalofs=(long)sizeof(vvp_vblob_t);
+      /* engine: pVertFlags = pVBlobHdr + vertflagsofs  (absolute rel-to-header).
+         Our per-blob layout is [datalen][flags[]][verts[]]; with numblobs==1
+         (always true here after we emit one combined blob below) this points
+         exactly at the flags array. For >1 LOD we keep a single merged flags
+         array in front of the first blob instead — see blob merge note. */
+      /* per-blob layout is [datalen][u32 flags x nv][verts x nv]; both flag and
+         vertex arrays therefore sit at fixed distances from the BLOB START.
+         Engine resolves:  pFlags = (u32*)((char*)pVBlobHdr + vertflagsofs) for
+         blob 0 only — studiomdl emits ONE shared flags array per model and
+         points every blob's local data via vertlocalofs. We mirror that:
+         flags live inside blob 0 (which holds ALL LOD vertices in our merged
+         scheme)? No — we keep per-LOD blobs, so we emit a SINGLE global flags
+         array right after the header block and set vertflagsofs to it. */
+      vb.vertflagsofs=(long)sizeof(vb)+total_lods*8+total_lods*4; /* after pairs+ofs[] */
+      vb.vertlocalofs=4;        /* rel to each blob start: past uint32 datalen... */
+                                /* ...but flags are GLOBAL here, so verts follow datalen */
       vb.blobarrayofs=(long)sizeof(vb)+total_lods*8;
       mb_put(&head,&vb,sizeof vb);
       for(i=0;i<total_lods;i++){ mb_i32(&head,(long)lod_nv[i]); mb_i32(&head,-1); }
@@ -244,11 +268,25 @@ int vtx_write(const char *basepath, const mesh_t *vis, mesh_t *lods[],
     for(i=0;i<total_lods;i++){ vvp_lodrec_t lr; memset(&lr,0,sizeof lr); mb_put(&head,&lr,sizeof lr); }
     ST32(head.d+md_pos+offsetof(vvp_mdata_t,lodrecordfirstofs), lr_pos-vc_pos);
 
-    /* ===== vertex blobs -> region VERTS ===== */
+    /* ===== global per-vertex flags array (all LODs concatenated) =====
+       Lives INSIDE the head region, directly after the vblob offset table
+       (position vb_arr+total_lods*4). vertflagsofs was set to exactly there.
+       Engine reads pFlags = pVBlobHdr + vertflagsofs once per model. */
+    { long flg_pos = vb_arr + total_lods*4;
+      long need = flg_pos + (long)cum_v*4;
+      if (need > head.cap) { while (need > head.cap) head.cap*=2;
+                             head.d=(u8*)realloc(head.d,head.cap); }
+      memset(head.d+flg_pos,0,(long)cum_v*4);
+      head.len = need;                      /* reserve it in the header region */
+    }
+
+    /* ===== vertex blobs -> region VERTS =====
+       blob = [uint32 datalen][modelvertex_t x nv];  vertlocalofs=4 (rel blob). */
     for(i=0;i<total_lods;i++){
         const mesh_t *m=(i==0)?vis:lods[i-1];
         unsigned int k; long bs=verts.len;
-        mb_i32(&verts,(long)m->nv*32);
+        long dl=(long)m->nv*32+4;
+        mb_i32(&verts,dl);
         for(k=0;k<m->nv;k++){
             float uv[2]={0.0f,0.0f};
             mb_put(&verts,&m->v[k],12);
@@ -274,17 +312,23 @@ int vtx_write(const char *basepath, const mesh_t *vis, mesh_t *lods[],
         memcpy(head.d+si_hdr_pos+sizeof(vvp_sihdr_t)+i*4,&bs,4);
     }
 
-    /* ===== fixup blobs -> region REST ===== */
+    /* ===== fixup blobs -> region REST =====
+       StripFixupHeader_t{numfixups=1, firstfixupofs}
+         -> StripFixup_t{type=STRIP_TABLE_FIXUP_LIST, next=0, numindexes=1,
+                         indexlistofs -> SourceDestListEntry_t{dest=0, source=0}}
+       All offsets inside a blob are RELATIVE TO THE BLOB START. */
     for(i=0;i<total_lods;i++){
         long bs=rest.len;
         vvp_fublob_t fh; vvp_fixup_t fx; vvp_sd_t sd;
-        fh.numfixups=1; fh.fixupsofs=sizeof(fh);
-        mb_put(&rest,&fh,sizeof fh);
+        fh.numfixups=1; fh.firstfixupofs=(v32)sizeof(fh);
+        mb_put(&rest,&fh,sizeof fh);                       /* +0 */
         fx.fixuptype=STRIP_TABLE_FIXUP_LIST;
-        fx.numsources=1; fx.nextoffset=0; fx.firstsourcedestofs=sizeof(fx);
-        mb_put(&rest,&fx,sizeof fx);
-        sd.destofs=0; sd.sourceofs=0;
-        mb_put(&rest,&sd,sizeof sd);
+        fx.nextfixupoffset=0;
+        fx.numindexes=1;
+        fx.indexlistofs=(v32)(sizeof(fh)+sizeof(fx));      /* rel to blob start */
+        mb_put(&rest,&fx,sizeof fx);                       /* +8 */
+        sd.destoffset=0; sd.sourceoffset=0;                /* strip 0 <- idx blob 0 */
+        mb_put(&rest,&sd,sizeof sd);                       /* +24 */
         memcpy(head.d+fu_hdr_pos+sizeof(vvp_fuhdr_t)+i*4,&bs,4);
     }
 
@@ -341,9 +385,16 @@ int vtx_write(const char *basepath, const mesh_t *vis, mesh_t *lods[],
       mh.listlen=(v32)matlen;
       mb_put(&rest,&mh,sizeof mh);
       mb_put(&rest,matline,matlen); mb_pad4(&rest);
-      /* one material entry */
-      mb_i32(&rest,matlen);
-      mb_put(&rest,matline,matlen); mb_pad4(&rest);
+      /* one material entry — engine appends ".vmt" when resolving,
+         so the stored name must NOT contain the extension */
+      { char nm[256]; long n;
+        strncpy(nm,matline,sizeof nm-1); nm[sizeof nm-1]=0;
+        n=(long)strlen(nm);
+        if (n>=4 && !memcmp(nm+n-4,".vmt",4)) n-=4;
+        nm[n]=0; n++;                 /* incl NUL */
+        mb_i32(&rest,(long)n);
+        mb_put(&rest,nm,n); mb_pad4(&rest);
+      }
       /* skin families: 1 family, 1 material, arrayIndex 0 */
       mb_i32(&rest,1);          /* numFamilies */
       mb_i32(&rest,1);          /* numMaterials in family */
@@ -378,8 +429,8 @@ int vtx_write(const char *basepath, const mesh_t *vis, mesh_t *lods[],
     /* header MatRepData */
     { ST32(head.d+offsetof(vvp_header_t,matreldataoffset),(rest_base+ml_pos)-(long)offsetof(vvp_header_t,materiallist_strlen));
       ST32(head.d+offsetof(vvp_header_t,materiallist_strlen),matlen);
-      ST32(head.d+offsetof(vvp_header_t,skins),1);
-      ST32(head.d+offsetof(vvp_header_t,materials),1);
+      ST32(head.d+offsetof(vvp_header_t,num_skins),1);
+      ST32(head.d+offsetof(vvp_header_t,num_materials),1);
     }
 
     f=fopen(path,"wb");
