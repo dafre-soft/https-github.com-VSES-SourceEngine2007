@@ -16,7 +16,7 @@ OUT_DIR="build"
 BIN="stl2mdl"
 SRCS=( "$SRC_DIR/main.c" "$SRC_DIR/stl.c" "$SRC_DIR/buf.c"
        "$SRC_DIR/simplify.c" "$SRC_DIR/physics.c" "$SRC_DIR/mdlwrite.c"
-       "$SRC_DIR/xmem.c" )
+       "$SRC_DIR/vtx.c" "$SRC_DIR/xmem.c" )
 
 MODE="all"
 JOBS="$( (nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) )"

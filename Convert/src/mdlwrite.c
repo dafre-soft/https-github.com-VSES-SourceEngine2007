@@ -394,7 +394,7 @@ int write_mdl_vvd(const char *basepath, const mesh_t *vis, mesh_t *lods[],
       if (bs2 && (!base || bs2 > base)) base = bs2;
       strncpy(nm, base ? base + 1 : o->out, 63);
       nm[63] = 0;
-      strncpy((char*)W.b.data+offsetof(studiohdr_c_t,name),nm,MDL_MAX_NAME-1);
+      strncpy((char*)W.b.data+offsetof(studiohdr_c_t,szname),nm,MDL_MAX_NAME-1);
       sdat=str_table_data(&slen);
       buf_pad(&W.b,4); buf_put(&W.b,sdat,slen);
       h=(studiohdr_c_t*)W.b.data;

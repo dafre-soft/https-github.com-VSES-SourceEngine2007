@@ -226,6 +226,7 @@ int main(int argc, char **argv) {
              (unsigned long long)(xm_budget()?(xm_budget()/(1024*1024)):0));
 
     if (write_mdl_vvd(o.out, vis, lods, o.nlods, &phys, &o) != 0) return 1;
+    if (vtx_write(o.out, vis, lods, o.nlods, &o) != 0) return 1;
 
     { int i; for (i=0;i<6;i++) mesh_free(lods[i]); }
     if (colldec != vis) mesh_free(colldec);

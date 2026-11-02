@@ -155,6 +155,8 @@ void phys_free(phys_t *p);
 /* --------------------------------------------------------------- output */
 int  write_mdl_vvd(const char *basepath, const mesh_t *vis, mesh_t *lods[],
                    int nlods, const phys_t *phys, const opts_t *o);
+int  vtx_write(const char *basepath, const mesh_t *vis, mesh_t *lods[],
+               int nlods, const opts_t *o);   /* .vtx (VVP) - required by engine */
 
 #define MSG(o, ...) do { if ((o)->verbose) { printf("[stl2mdl] "); printf(__VA_ARGS__); printf("\n"); } } while (0)
 #define INFO(...)  do { printf("[stl2mdl] "); printf(__VA_ARGS__); printf("\n"); } while (0)
