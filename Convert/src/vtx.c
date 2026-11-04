@@ -17,7 +17,8 @@ typedef unsigned short u16;
 typedef int32_t v32;   /* VVP fields are always 4 bytes */
 
 #define VVP_VERSION 64
-#define VVP_ID      0x44485056L   /* MAKEID('V','P','H','D') little-endian */
+#define VVP_ID      0x44485056L   /* MAKEID('V','P','H','D'): little-endian u32,
+                                     on-disk byte sequence is exactly "VPHD" */
 
 enum { MODELVERT_TYPE_3D = 0 };
 enum { STRIP_TABLE_FIXUP_LIST = 0 };
@@ -38,8 +39,16 @@ typedef struct {                       /* VertexFileHeader_t — canonical SDK l
 typedef int vvp_header_size_check[ (sizeof(vvp_header_t)==56) ? 1 : -1 ];
 
 typedef struct {                       /* VertCacheHeader_t — canonical SDK layout
-                                        (verified against gordon2 vertex_file_layout) */
-    v32 vertblockheaderofs;            /* all eight: RELATIVE to VertCacheHeader */
+                                        (vertex_file_layout_public.h, VVP ver<=76).
+                                        Field order is FIXED by the engine:
+                                        6 stats, then 10 rel-to-self pointers. */
+    v32 maxnum_bones_per_hardware_vb;
+    v32 maxnum_bones_per_software_vb;
+    v32 maxnum_bones_per_strip;
+    v32 maxnum_bones_per_triangles;
+    v32 maxnum_verts_per_hw_vb;
+    v32 maxnum_tris_per_hw_vb;
+    v32 vertblockheaderofs;            /* RELATIVE to VertCacheHeader */
     v32 stripindexblockheaderofs;
     v32 fixupblockheaderofs;
     v32 bodypartofs;
@@ -47,12 +56,6 @@ typedef struct {                       /* VertCacheHeader_t — canonical SDK la
     v32 boneflexcontrollerdescfirstofs;
     v32 num_bone_flex_pair_descs;
     v32 boneflexpairdescfirstofs;
-    v32 maxnum_bones_per_hardware_vb;
-    v32 maxnum_bones_per_software_vb;
-    v32 maxnum_bones_per_strip;
-    v32 maxnum_bones_per_triangles;
-    v32 maxnum_verts_per_hw_vb;
-    v32 maxnum_tris_per_hw_vb;
     v32 maxmodeldeform;
     v32 maxscale;                      /* VertexFileHeader_t::maxscale */
 } vvp_vc_t;                            /* 64 bytes */
