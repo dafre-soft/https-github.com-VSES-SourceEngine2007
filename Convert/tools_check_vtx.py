@@ -17,8 +17,10 @@ def main(path):
     ver=i32(4)
     vc=u32(28); lodofs=u32(32)
     print(f"VVP ver={ver} size={n} vertcacheofs={vc} lodofs={lodofs}")
-    # VertCacheHeader_t = 64 bytes; block offsets live at +36..+48, RELATIVE to vc
-    vbh=vc+i32(vc+36); sih=vc+i32(vc+40); fuh=vc+i32(vc+44); bpd=vc+i32(vc+48)
+    # VertCacheHeader_t = 64 bytes (gordon2 layout): the four block pointers
+    # (vertblockheaderofs, stripindexblockheaderofs, fixupblockheaderofs,
+    # bodypartofs) are the FIRST fields, RELATIVE to VertCacheHeader itself.
+    vbh=vc+i32(vc+0); sih=vc+i32(vc+4); fuh=vc+i32(vc+8); bpd=vc+i32(vc+12)
     nb=u32(vbh); blobarr=vbh+u32(vbh+4)
     nsi=u32(sih); siarr=sih+u32(sih+4)
     nfu=u32(fuh); fuarr=fuh+u32(fuh+4)

@@ -17,7 +17,8 @@ typedef unsigned short u16;
 typedef int32_t v32;   /* VVP fields are always 4 bytes */
 
 #define VVP_VERSION 64
-#define VVP_ID      0x44485056L   /* MAKEID('V','P','H','D') little-endian */
+#define VVP_ID      0x44485056L   /* MAKEID('V','P','H','D'): little-endian u32,
+                                     on-disk byte sequence is exactly "VPHD" */
 
 enum { MODELVERT_TYPE_3D = 0 };
 enum { STRIP_TABLE_FIXUP_LIST = 0 };
